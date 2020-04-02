@@ -6,7 +6,30 @@
 #include "IRCMessage.h"
 #include "IRCReceiver.h"
 
-static int doRead(int sock, char * buf, int buf_size)
+void IRCReceiver::Init(CTCPReaderWriterClient *sock, IRCMessageQueue *q)
+{
+	ircSock = sock;
+	recvQ = q;
+}
+
+IRCReceiver::~IRCReceiver()
+{
+}
+
+bool IRCReceiver::startWork()
+{
+	terminateThread = false;
+	rec_thread = std::async(std::launch::async, &IRCReceiver::Entry, this);
+	return true;
+}
+
+void IRCReceiver::stopWork()
+{
+	terminateThread = true;
+	rec_thread.get();
+}
+
+int IRCReceiver::doRead(CTCPReaderWriterClient *ircSock, char *buf, int buf_size)
 {
 	struct timeval tv;
 	tv.tv_sec = 1;
@@ -14,26 +37,27 @@ static int doRead(int sock, char * buf, int buf_size)
 	fd_set rdset;
 	fd_set errset;
 
+	int fd = ircSock->GetFD();
 	FD_ZERO(&rdset);
 	FD_ZERO(&errset);
-	FD_SET(sock, &rdset);
-	FD_SET(sock, &errset);
+	FD_SET(fd, &rdset);
+	FD_SET(fd, &errset);
 
 	int res;
 
-	res = select(sock+1, &rdset, NULL, &errset, &tv);
+	res = select(fd+1, &rdset, NULL, &errset, &tv);
 
 	if ( res < 0 ) {
 		printf("IRCReceiver::doread: select() error.\n");
 		return -1;
 	} else if ( res > 0 ) {
-		if (FD_ISSET(sock, &errset)) {
+		if (FD_ISSET(fd, &errset)) {
 			printf("IRCReceiver::doRead: FD_ISSET error\n");
 			return -1;
 		}
 
-		if (FD_ISSET(sock, &rdset)) {
-			res = recv(sock, buf, buf_size, 0);
+		if (FD_ISSET(fd, &rdset)) {
+			res = ircSock->Read((unsigned char *)buf, buf_size);
 
 			if (res < 0) {
 				printf("IRCReceiver::doRead: recv error\n");
@@ -59,7 +83,7 @@ void IRCReceiver::Entry()
 
 	while (!terminateThread) {
 		char buf[200];
-		int r = doRead(sock, buf, sizeof buf);
+		int r = doRead(ircSock, buf, sizeof buf);
 
 		if (r < 0) {
 			recvQ->signalEOF();
@@ -131,27 +155,4 @@ void IRCReceiver::Entry()
 	} // while
 
 	return;
-}
-
-IRCReceiver::IRCReceiver(int sock, IRCMessageQueue *q)
-{
-	this->sock = sock;
-	recvQ = q;
-}
-
-IRCReceiver::~IRCReceiver()
-{
-}
-
-bool IRCReceiver::startWork()
-{
-	terminateThread = false;
-	rec_thread = std::async(std::launch::async, &IRCReceiver::Entry, this);
-	return true;
-}
-
-void IRCReceiver::stopWork()
-{
-	terminateThread = true;
-	rec_thread.get();
 }

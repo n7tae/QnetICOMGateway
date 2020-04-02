@@ -1,6 +1,9 @@
+#pragma once
 /*
- *   Copyright (C) 2010 by Scott Lawson KI4LKF
- *   Copyright (C) 2017-2018 by Thomas Early N7TAE
+ *   Copyright (c) 1994 by Robert Morelos-Zaragoza. All rights reserved.
+ *   See http://www.eccpage.com/golay23.c
+ *   Copyright (C) 2010 by Michael Dirska, DL1BFF (dl1bff@mdx.de)
+ *   Copyright (C) 2020 by Thomas Early N7TAE
  *
  *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -17,22 +20,20 @@
  *   Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
-#pragma once
+class CDStarDecode {
+public:
+	CDStarDecode();
+	~CDStarDecode() {}
+	int Decode(const unsigned char *d, int data[3]);
 
-#include <string>
-#include <vector>
-#include <ctime>
+private:
+	// functions
+	long get_syndrome(long pattern);
+	long arr2int(int a[], int r);
+	void nextcomb(int n, int r, int a[]);
+	int golay2412(int data, int *decoded);
 
-time_t parseTime(const std::string str);
-
-std::vector<std::string> stringTokenizer(const std::string &str);
-
-void safeStringCopy(char * dest, const char * src, unsigned int buf_size);
-
-char *getCurrentTime(void);
-
-void ToUpper(std::string &str);
-
-void ToLower(std::string &str);
-
-void ReplaceChar(std::string &str, char from, char to);
+	// data
+	long decoding_table[2048];
+	int prng[4096];
+};
