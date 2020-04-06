@@ -19,36 +19,40 @@
 #include <set>
 #include <map>
 #include <string>
+#include <regex>
+
 #include "QnetTypeDefs.h"
 #include "SEcho.h"
-
+#include "QnetDB.h"
 #include "aprs.h"
+#include "DStarDecode.h"
+#include "SockAddress.h"
 
 #define IP_SIZE 15
 #define MAXHOSTNAMELEN 64
 #define CALL_SIZE 8
 #define MAX_DTMF_BUF 32
 
-typedef struct to_remote_g2_tag {
+using STOREMOTEG2 = struct to_remote_g2_tag {
 	unsigned short streamid;
-	struct sockaddr_in toDst4;
+	CSockAddress addr;
 	time_t last_time;
-} STOREMOTEG2;
+};
 
-typedef struct torepeater_tag {
+using STOREPEATER = struct torepeater_tag {
 	// help with header re-generation
 	unsigned char saved_hdr[58]; // repeater format
-	uint32_t saved_adr;
+	CSockAddress saved_adr;
 
 	unsigned short streamid;
-	uint32_t adr;
-	struct sockaddr_in band_addr;
+	CSockAddress adr;
+	CSockAddress addr;
 	time_t last_time;
 	std::atomic<unsigned short> G2_COUNTER;
 	unsigned char sequence;
-} STOREPEATER;
+};
 
-typedef struct band_txt_tag {
+using SBANDTXT = struct band_txt_tag {
 	unsigned short streamID;
 	unsigned char flags[3];
 	char lh_mycall[CALL_SIZE + 1];
@@ -61,7 +65,7 @@ typedef struct band_txt_tag {
 	unsigned short txt_cnt;
 	bool sent_key_on_msg;
 
-	char dest_rptr[CALL_SIZE + 1];
+	std::string dest_rptr;
 
 	// try to process GPS mode: GPRMC and ID
 	char temp_line[256];
@@ -74,7 +78,7 @@ typedef struct band_txt_tag {
 	int num_dv_frames;
 	int num_dv_silent_frames;
 	int num_bit_errors;
-} SBANDTXT;
+};
 
 class CQnetGateway {
 public:
@@ -93,9 +97,9 @@ private:
 
 	SPORTIP g2_internal, g2_external, g2_link, ircddb;
 
-	std::string OWNER, owner, local_irc_ip, status_file, dtmf_dir, dtmf_file, echotest_dir, irc_pass, qnvoicefile;
+	std::string OWNER, owner, dtmf_dir, dtmf_file, echotest_dir, irc_pass, qnvoicefile, DASH_SHOW_ORDER, DASH_SQL_NAME;
 
-	bool bool_send_qrgs, bool_irc_debug, bool_log_debug, bool_dtmf_debug, bool_regen_header, bool_qso_details, bool_send_aprs, playNotInCache, GATEWAY_HEALING;
+	bool bool_send_qrgs, bool_irc_debug, bool_log_debug, bool_dtmf_debug, bool_regen_header, bool_qso_details, bool_send_aprs, playNotInCache, GATEWAY_HEALING, showLastHeard;
 
 	int play_wait, play_delay, echotest_rec_timeout, voicemail_rec_timeout, from_remote_g2_timeout, from_local_rptr_timeout, dtmf_digit;
 
@@ -103,7 +107,7 @@ private:
 
 	unsigned int vPacketCount;
 
-	std::map <uint32_t, uint16_t> portmap;
+	std::map <std::string, unsigned short> portmap;
 	std::set<std::string> findRoute;
 
 	// data needed for aprs login and aprs beacon
@@ -120,7 +124,7 @@ private:
 
 	// input from remote G2 gateway
 	int g2_sock = -1;
-	struct sockaddr_in fromDst4;
+	CSockAddress fromDst4;
 
 	// Incoming data from remote systems
 	// must be fed into our local repeater modules.
@@ -129,41 +133,43 @@ private:
 	// input from our own local repeater modules
 	int srv_sock = -1;
 	SDSTR rptrbuf; // 58 or 29 or 32, max is 58
-	struct sockaddr_in fromRptr;
+	CSockAddress fromRptr;
 
 	SDSTR end_of_audio;
 
 	// send packets to g2_link
-	struct sockaddr_in plug;
+	CSockAddress plug;
 
 	// for talking with the irc server
 	CIRCDDB *ii;
 	// for handling APRS stuff
 	CAPRS *aprs;
 
+	// sqlite3 database
+	CQnetDB qnDB;
+
+	// DStar decoder
+	CDStarDecode dstar_decode;
+
 	// text coming from local repeater bands
 	SBANDTXT band_txt[3]; // 0=A, 1=B, 2=C
 
 	/* Used to validate MYCALL input */
-	regex_t preg;
-
-	// CACHE used to cache users, repeaters,
-	// gateways, IP numbers coming from the irc server
-
-	std::map<std::string, std::string> user2rptr_map, rptr2gwy_map, gwy2ip_map;
+	std::regex preg;
 
 	pthread_mutex_t irc_data_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 	int open_port(const SPORTIP &pip);
 	void calcPFCS(unsigned char *packet, int len);
 	void GetIRCDataThread();
-	int get_yrcall_rptr_from_cache(char *call, char *arearp_cs, char *zonerp_cs, char *mod, char *ip, char RoU);
-	bool get_yrcall_rptr(char *call, char *arearp_cs, char *zonerp_cs, char *mod, char *ip, char RoU);
+	int get_yrcall_rptr_from_cache(const std::string &call, std::string &rptr, std::string &gate, std::string &addr, char RoU);
+	bool get_yrcall_rptr(const std::string &call, std::string &rptr, std::string &gate, std::string &addr, char RoU);
 	void PlayFileThread(SECHO &edata);
 	void compute_aprs_hash();
 	void APRSBeaconThread();
 	void ProcessTimeouts();
 	void ProcessSlowData(unsigned char *data, unsigned short sid);
+	bool ProcessG2Msg(const unsigned char *data, const int mod, std::string &smrtgrp);
 	bool Flag_is_ok(unsigned char flag);
 	void UnpackCallsigns(const std::string &str, std::set<std::string> &set, const std::string &delimiters = ",");
 	void PrintCallsigns(const std::string &key, const std::set<std::string> &set);
@@ -178,6 +184,6 @@ private:
 
 	void qrgs_and_maps();
 
-	void set_dest_rptr(int mod_ndx, char *dest_rptr);
+	void set_dest_rptr(const char mode, std::string &call);
 	bool validate_csum(SBANDTXT &bt, bool is_gps);
 };

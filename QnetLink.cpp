@@ -54,6 +54,9 @@
 
 #define VERSION "1.10"
 
+#ifndef CFG_DIR
+#define CFG_DIR "/usr/local/etc"
+#endif
 
 std::atomic<bool> CQnetLink::keep_running(true);
 
@@ -69,7 +72,7 @@ CQnetLink::~CQnetLink()
 	speak.clear();
 }
 
-bool CQnetLink::resolve_rmt(char *name, int type, struct sockaddr_in *addr)
+bool CQnetLink::resolve_rmt(const char *name, const unsigned short port, CSockAddress &addr)
 {
 	struct addrinfo hints;
 	struct addrinfo *res;
@@ -77,8 +80,8 @@ bool CQnetLink::resolve_rmt(char *name, int type, struct sockaddr_in *addr)
 	bool found = false;
 
 	memset(&hints, 0x00, sizeof(struct addrinfo));
-	hints.ai_family = AF_INET;
-	hints.ai_socktype = type;
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_DGRAM;
 
 	int rc = getaddrinfo(name, NULL, &hints, &res);
 	if (rc != 0) {
@@ -86,32 +89,48 @@ bool CQnetLink::resolve_rmt(char *name, int type, struct sockaddr_in *addr)
 		return false;
 	}
 
-	for (rp = res; rp != NULL; rp = rp->ai_next) {
-		if ((rp->ai_family == AF_INET) &&
-		        (rp->ai_socktype == type)) {
-			memcpy(addr, rp->ai_addr, sizeof(struct sockaddr_in));
-			found = true;
-			break;
+	for (rp=res; rp!=NULL; rp=rp->ai_next) {
+		if ((AF_INET==rp->ai_family || AF_INET6==rp->ai_family) && SOCK_DGRAM==rp->ai_socktype) {
+            if (AF_INET == rp->ai_family) {
+                char saddr[INET_ADDRSTRLEN];
+                struct sockaddr_in *addr4 = (struct sockaddr_in *)rp->ai_addr;
+                if (inet_ntop(rp->ai_family, &addr4->sin_addr, saddr, INET_ADDRSTRLEN)) {
+                    addr.Initialize(rp->ai_family, port, saddr);
+                    found = true;
+                    break;
+                }
+            } else if (AF_INET6 == rp->ai_family) {
+                char saddr[INET6_ADDRSTRLEN];
+                struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)rp->ai_addr;
+                if (inet_ntop(rp->ai_family, &addr6->sin6_addr, saddr, INET6_ADDRSTRLEN)) {
+                    addr.Initialize(rp->ai_family, port, saddr);
+                    found = true;
+                    break;
+                }
+            }
 		}
 	}
 	freeaddrinfo(res);
+
+    if (found && strcmp(name, addr.GetAddress())) {
+        printf("Node address %s on port %u resolved to %s\n", name, port, addr.GetAddress());
+    }
+
 	return found;
 }
 
 /* send keepalive to donglers */
 void CQnetLink::send_heartbeat()
 {
-	bool removed = false;
-
 	for (auto pos = inbound_list.begin(); pos != inbound_list.end(); pos++) {
 		SINBOUND *inbound = (SINBOUND *)pos->second;
-		sendto(ref_g2_sock, REF_ACK, 3, 0, (struct sockaddr *)&(inbound->sin), sizeof(struct sockaddr_in));
+		sendto(ref_g2_sock, REF_ACK, 3, 0, inbound->addr.GetPointer(), inbound->addr.GetSize());
 
 		if (inbound->countdown >= 0)
 			inbound->countdown --;
 
 		if (inbound->countdown < 0) {
-			removed = true;
+			qnDB.DeleteLS(pos->first.c_str());
 			printf("call=%s timeout, removing %s, users=%d\n", inbound->call, pos->first.c_str(), (int)inbound_list.size() - 1);
 
 			free(pos->second);
@@ -119,8 +138,6 @@ void CQnetLink::send_heartbeat()
 			inbound_list.erase(pos);
 		}
 	}
-	if (removed)
-		print_status_file();
 }
 
 void CQnetLink::rptr_ack(short i)
@@ -139,11 +156,11 @@ void CQnetLink::rptr_ack(short i)
 
 	if (to_remote_g2[i].is_connected) {
 		memcpy(mod_and_RADIO_ID[i] + 1, "LINKED TO ", 10);
-		memcpy(mod_and_RADIO_ID[i] + 11, to_remote_g2[i].to_call, CALL_SIZE);
+		memcpy(mod_and_RADIO_ID[i] + 11, to_remote_g2[i].cs, CALL_SIZE);
 		mod_and_RADIO_ID[i][11 + CALL_SIZE] = to_remote_g2[i].to_mod;
-	} else if (to_remote_g2[i].to_call[0] != '\0') {
+	} else if (to_remote_g2[i].cs[0] != '\0') {
 		memcpy(mod_and_RADIO_ID[i] + 1, "TRYING    ", 10);
-		memcpy(mod_and_RADIO_ID[i] + 11, to_remote_g2[i].to_call, CALL_SIZE);
+		memcpy(mod_and_RADIO_ID[i] + 11, to_remote_g2[i].cs, CALL_SIZE);
 		mod_and_RADIO_ID[i][11 + CALL_SIZE] = to_remote_g2[i].to_mod;
 	} else {
 		memcpy(mod_and_RADIO_ID[i] + 1, "NOT LINKED", 10);
@@ -210,7 +227,7 @@ void CQnetLink::RptrAckThread(char *arg)
 
 	memcpy(dsvt.hdr.sfx, "RPTR", 4);
 	calcPFCS(dsvt.title,56);
-	sendto(rptr_sock, dsvt.title, 56, 0, (struct sockaddr *)&toLocalg2, sizeof(toLocalg2));
+	sendto(rptr_sock, dsvt.title, 56, 0, toLocalg2.GetPointer(), toLocalg2.GetSize());
 	std::this_thread::sleep_for(std::chrono::milliseconds(delay_between));
 
 	dsvt.config = 0x20;
@@ -273,39 +290,9 @@ void CQnetLink::RptrAckThread(char *arg)
 				dsvt.vasd.text[2] = 0xf5;
 				break;
 		}
-		sendto(rptr_sock, dsvt.title, 27, 0, (struct sockaddr *)&toLocalg2, sizeof(toLocalg2));
+		sendto(rptr_sock, dsvt.title, 27, 0, toLocalg2.GetPointer(), toLocalg2.GetSize());
 		if (i < 9)
 			std::this_thread::sleep_for(std::chrono::milliseconds(delay_between));
-	}
-}
-
-void CQnetLink::print_status_file()
-{
-	FILE *statusfp = fopen(status_file.c_str(), "w");
-	if (!statusfp)
-		printf("Failed to create status file %s\n", status_file.c_str());
-	else {
-		setvbuf(statusfp, (char *)NULL, _IOLBF, 0);
-		struct tm tm1;
-		time_t tnow;
-		const char *fstr = "%c,%s,%c,%s,%02d%02d%02d,%02d:%02d:%02d\n";
-		time(&tnow);
-		localtime_r(&tnow, &tm1);
-
-		/* print connected donglers */
-		for (auto pos = inbound_list.begin(); pos != inbound_list.end(); pos++) {
-			SINBOUND *inbound = (SINBOUND *)pos->second;
-			fprintf(statusfp, fstr, 'p', inbound->call, 'p', pos->first.c_str(), tm1.tm_mon+1,tm1.tm_mday,tm1.tm_year % 100, tm1.tm_hour,tm1.tm_min,tm1.tm_sec);
-		}
-
-		/* print linked repeaters-reflectors */
-		for (int i=0; i<3;i++) {
-			if (to_remote_g2[i].is_connected) {
-				fprintf(statusfp, fstr, to_remote_g2[i].from_mod, to_remote_g2[i].to_call, to_remote_g2[i].to_mod, inet_ntoa(to_remote_g2[i].toDst4.sin_addr),
-					tm1.tm_mon+1, tm1.tm_mday ,tm1.tm_year % 100, tm1.tm_hour, tm1.tm_min, tm1.tm_sec);
-			}
-		}
-		fclose(statusfp);
 	}
 }
 
@@ -539,7 +526,7 @@ bool CQnetLink::ReadConfig(const char *cfgFile)
 			rf_inactivity_timer[i] *= 60;
 			if (cfg.KeyExists(key+"_link_at_start"))
 				cfg.GetValue(key+"_link_at_start", modem_type, link_at_startup[i], 8, 8);
-			cfg.GetValue(key+"_auto_link", modem_type, auto_link[i]);
+			cfg.GetValue(key+"_auto_link", modem_type, to_remote_g2[i].auto_link);
 		}
 	}
 	if (0 == modules) {
@@ -572,27 +559,32 @@ bool CQnetLink::ReadConfig(const char *cfgFile)
 		}
 	}
 
+	int ivalue;
 	key.assign("link_");
 	cfg.GetValue(key+"acknowledge", estr, bool_rptr_ack);
 	cfg.GetValue(key+"announce",    estr, announce);
 	cfg.GetValue(key+"incoming_ip", estr, my_g2_link_ip,       7, IP_SIZE);
-	cfg.GetValue(key+"port",        estr, my_g2_link_port, 10000,   65535);
-	cfg.GetValue(key+"ref_port",    estr, rmt_ref_port,    10000,   65535);
-	cfg.GetValue(key+"xrf_port",    estr, rmt_xrf_port,    10000,   65535);
-	cfg.GetValue(key+"dcs_port",    estr, rmt_dcs_port,    10000,   65535);
+	cfg.GetValue(key+"port",        estr, ivalue,    10000,   65535);
+	my_g2_link_port = ivalue;
+	cfg.GetValue(key+"ref_port",    estr, ivalue,    10000,   65535);
+	rmt_ref_port = ivalue;
+	cfg.GetValue(key+"xrf_port",    estr, ivalue,    10000,   65535);
+	rmt_xrf_port = ivalue;
+	cfg.GetValue(key+"dcs_port",    estr, ivalue,    10000,   65535);
+	rmt_dcs_port = ivalue;
 	int maxdongle;
 	cfg.GetValue(key+"max_dongles", estr, maxdongle, 0, 10);
 	saved_max_dongles = max_dongles = (unsigned int)maxdongle;
 
 	key.assign("gateway_");
-	cfg.GetValue(key+"ip",            estr, to_g2_internal_ip,      7, IP_SIZE);
-	cfg.GetValue(key+"external_port", estr, to_g2_external_port, 1024,   65535);
+	cfg.GetValue(key+"ip",            estr, to_g2_internal_ip,    7, IP_SIZE);
+	cfg.GetValue(key+"external_port", estr, ivalue,            1024,   65535);
+	to_g2_external_port = ivalue;
 
 	cfg.GetValue("log_qso", estr, qso_details);
 
 	key.assign("file_");
 	cfg.GetValue(key+"gwys",         estr,         gwys, 2, FILENAME_MAX);
-	cfg.GetValue(key+"status",       estr,  status_file, 2, FILENAME_MAX);
 	cfg.GetValue(key+"qnvoicefile",  estr, qnvoice_file, 2, FILENAME_MAX);
 	cfg.GetValue(key+"announce_dir", estr, announce_dir, 2, FILENAME_MAX);
 
@@ -612,6 +604,8 @@ bool CQnetLink::ReadConfig(const char *cfgFile)
 		ToUpper(login_call);
 		login_call.resize(CALL_SIZE, ' ');
 	}
+
+	cfg.GetValue("dash_sql_filename", estr, dash_sql_filename, 2, 32);
 
 	return false;
 }
@@ -709,22 +703,19 @@ bool CQnetLink::srv_open()
 	}
 
 	/* the local G2 runs on this IP and port */
-	memset(&toLocalg2, 0, sizeof(struct sockaddr_in));
-	toLocalg2.sin_family = AF_INET;
-	toLocalg2.sin_addr.s_addr = inet_addr(to_g2_internal_ip.c_str());
-	toLocalg2.sin_port = htons(to_g2_external_port);
+	toLocalg2.Initialize(AF_INET, to_g2_external_port, to_g2_internal_ip.c_str());
 
 	/* initialize all remote links */
 	for (i = 0; i < 3; i++) {
-		to_remote_g2[i].to_call[0] = '\0';
-		memset(&(to_remote_g2[i].toDst4), 0, sizeof(struct sockaddr_in));
+		memset(to_remote_g2[i].cs, 0, 9);
+		to_remote_g2[i].addr.Clear();
 		to_remote_g2[i].from_mod = ' ';
 		to_remote_g2[i].to_mod = ' ';
 		to_remote_g2[i].countdown = 0;
 		to_remote_g2[i].is_connected = false;
 		to_remote_g2[i].in_streamid = 0x0;
 		to_remote_g2[i].out_streamid = 0x0;
-		auto_link[i] = true;
+		to_remote_g2[i].auto_link = true;
 	}
 	return true;
 }
@@ -765,15 +756,13 @@ void CQnetLink::g2link(const char from_mod, const char *call, const char to_mod)
 
 	char host[MAXHOSTNAMELEN + 1];
 	char port_s[5 + 1];
-	int port_i;
+	unsigned short port_i;
 
 	/* host + space + port + NULL */
 	char payload[MAXHOSTNAMELEN + 1 + 5 + 1];
 	char *p = NULL;
 
 	char link_request[519];
-
-	bool ok = false;
 
 	memset(link_request, 0, sizeof(link_request));
 
@@ -792,23 +781,30 @@ void CQnetLink::g2link(const char from_mod, const char *call, const char to_mod)
 		return;
 	}
 
-	memset(&to_remote_g2[i], 0, sizeof(to_remote_g2[i]));
+	to_remote_g2[i].addr.Clear();
+	to_remote_g2[i].countdown = 0;
+	memset(to_remote_g2[i].cs, 0, 9);
+	to_remote_g2[i].from_mod = '\0';
+	to_remote_g2[i].in_streamid = 0U;
+	to_remote_g2[i].is_connected = false;
+	to_remote_g2[i].out_streamid = 0U;
+	to_remote_g2[i].to_mod = '\0';
 
-	strcpy(to_remote_g2[i].to_call, call);
+	strcpy(to_remote_g2[i].cs, call);
 	to_remote_g2[i].to_mod = to_mod;
 
 	if ((memcmp(call, "REF", 3) == 0) || (memcmp(call, "DCS", 3) == 0)) {
 		for (counter = 0; counter < 3; counter++) {
 			if (counter != i) {
-				if ('\0'!=to_remote_g2[counter].to_call[0] && !strcmp(to_remote_g2[counter].to_call,to_remote_g2[i].to_call) && to_remote_g2[counter].to_mod==to_remote_g2[i].to_mod)
+				if ('\0'!=to_remote_g2[counter].cs[0] && !strcmp(to_remote_g2[counter].cs,to_remote_g2[i].cs) && to_remote_g2[counter].to_mod==to_remote_g2[i].to_mod)
 					break;
 			}
 		}
-		to_remote_g2[i].to_call[0] = '\0';
+		to_remote_g2[i].cs[0] = '\0';
 		to_remote_g2[i].to_mod = ' ';
 
 		if (counter < 3) {
-			printf("Another mod(%c) is already linked to %s %c\n", to_remote_g2[counter].from_mod, to_remote_g2[counter].to_call, to_remote_g2[counter].to_mod);
+			printf("Another mod(%c) is already linked to %s %c\n", to_remote_g2[counter].from_mod, to_remote_g2[counter].cs, to_remote_g2[counter].to_mod);
 			return;
 		}
 	}
@@ -832,19 +828,24 @@ void CQnetLink::g2link(const char from_mod, const char *call, const char to_mod)
 
 	strcpy(host, payload);
 	strcpy(port_s, p + 1);
-	port_i = atoi(port_s);
+	port_i = (unsigned short)atoi(port_s);
 
 	if (host[0] != '\0') {
-		ok = resolve_rmt(host, SOCK_DGRAM, &(to_remote_g2[i].toDst4));
+		bool ok = resolve_rmt(host, port_i, to_remote_g2[i].addr);
 		if (!ok) {
 			printf("Call %s is host %s but could not resolve to IP\n", call, host);
-			memset(&to_remote_g2[i], 0, sizeof(to_remote_g2[i]));
+			to_remote_g2[i].addr.Clear();
+			to_remote_g2[i].countdown = 0;
+			memset(to_remote_g2[i].cs, 0, 9);
+			to_remote_g2[i].from_mod = '\0';
+			to_remote_g2[i].in_streamid = 0U;
+			to_remote_g2[i].is_connected = false;
+			to_remote_g2[i].out_streamid = 0U;
+			to_remote_g2[i].to_mod = '\0';
 			return;
 		}
 
-		strcpy(to_remote_g2[i].to_call, call);
-		to_remote_g2[i].toDst4.sin_family = AF_INET;
-		to_remote_g2[i].toDst4.sin_port = htons(port_i);
+		strcpy(to_remote_g2[i].cs, call);
 		to_remote_g2[i].from_mod = from_mod;
 		to_remote_g2[i].to_mod = to_mod;
 		to_remote_g2[i].countdown = TIMEOUT;
@@ -858,30 +859,30 @@ void CQnetLink::g2link(const char from_mod, const char *call, const char to_mod)
 			link_request[9] = to_mod;
 			link_request[10] = '\0';
 
-			printf("sending link request from mod %c to link with: [%s] mod %c [%s]\n", to_remote_g2[i].from_mod, to_remote_g2[i].to_call, to_remote_g2[i].to_mod, payload);
+			printf("sending link request from mod %c to link with: [%s] mod %c [%s]\n", to_remote_g2[i].from_mod, to_remote_g2[i].cs, to_remote_g2[i].to_mod, payload);
 
 			for (j=0; j<5; j++)
-				sendto(xrf_g2_sock, link_request, CALL_SIZE + 3, 0, (struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(to_remote_g2[i].toDst4));
+				sendto(xrf_g2_sock, link_request, CALL_SIZE + 3, 0, to_remote_g2[i].addr.GetPointer(), to_remote_g2[i].addr.GetSize());
 		} else if (port_i == rmt_dcs_port) {
 			strcpy(link_request, owner.c_str());
 			link_request[8] = from_mod;
 			link_request[9] = to_mod;
 			link_request[10] = '\0';
-			memcpy(link_request + 11, to_remote_g2[i].to_call, 8);
+			memcpy(link_request + 11, to_remote_g2[i].cs, 8);
 			strcpy(link_request + 19, "<table border=\"0\" width=\"95%\"><tr><td width=\"4%\"><img border=\"0\" src=g2ircddb.jpg></td><td width=\"96%\"><font size=\"2\"><b>REPEATER</b> QnetGateway v1.0+</font></td></tr></table>");
 
-			printf("sending link request from mod %c to link with: [%s] mod %c [%s]\n", to_remote_g2[i].from_mod, to_remote_g2[i].to_call, to_remote_g2[i].to_mod, payload);
-			sendto(dcs_g2_sock, link_request, 519, 0, (struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(to_remote_g2[i].toDst4));
+			printf("sending link request from mod %c to link with: [%s] mod %c [%s]\n", to_remote_g2[i].from_mod, to_remote_g2[i].cs, to_remote_g2[i].to_mod, payload);
+			sendto(dcs_g2_sock, link_request, 519, 0, to_remote_g2[i].addr.GetPointer(), to_remote_g2[i].addr.GetSize());
 		} else if (port_i == rmt_ref_port) {
 			for (counter = 0; counter < 3; counter++) {
 				if (counter != i) {
-					if ( (to_remote_g2[counter].to_call[0] != '\0') &&
-					        (strcmp(to_remote_g2[counter].to_call,to_remote_g2[i].to_call) == 0) )
+					if ( (to_remote_g2[counter].cs[0] != '\0') &&
+					        (strcmp(to_remote_g2[counter].cs,to_remote_g2[i].cs) == 0) )
 						break;
 				}
 			}
 			if (counter > 2) {
-				printf("sending link command from mod %c to: [%s] mod %c [%s]\n", to_remote_g2[i].from_mod, to_remote_g2[i].to_call, to_remote_g2[i].to_mod, payload);
+				printf("sending link command from mod %c to: [%s] mod %c [%s]\n", to_remote_g2[i].from_mod, to_remote_g2[i].cs, to_remote_g2[i].to_mod, payload);
 
 				queryCommand[0] = 5;
 				queryCommand[1] = 0;
@@ -889,23 +890,22 @@ void CQnetLink::g2link(const char from_mod, const char *call, const char to_mod)
 				queryCommand[3] = 0;
 				queryCommand[4] = 1;
 
-				sendto(ref_g2_sock, queryCommand, 5, 0, (struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(to_remote_g2[i].toDst4));
+				sendto(ref_g2_sock, queryCommand, 5, 0, to_remote_g2[i].addr.GetPointer(), to_remote_g2[i].addr.GetSize());
 			} else {
 				if (to_remote_g2[counter].is_connected) {
 					to_remote_g2[i].is_connected = true;
 					printf("Local module %c is also connected to %s %c\n", from_mod, call, to_mod);
-
-					print_status_file();
 					tracing[i].last_time = time(NULL);
+					qnDB.UpdateLS(to_remote_g2[i].addr.GetAddress(), to_remote_g2[i].from_mod, to_remote_g2[i].cs, to_remote_g2[i].to_mod, tracing[i].last_time);
 
 					// announce it here
-					strcpy(linked_remote_system, to_remote_g2[i].to_call);
+					strcpy(linked_remote_system, to_remote_g2[i].cs);
 					space_p = strchr(linked_remote_system, ' ');
 					if (space_p)
 						*space_p = '\0';
 					sprintf(notify_msg[i], "%c_linked.dat_LINKED_%s_%c", to_remote_g2[i].from_mod, linked_remote_system, to_remote_g2[i].to_mod);
 				} else
-					printf("status from %s %c pending\n", to_remote_g2[i].to_call, to_remote_g2[i].to_mod);
+					printf("status from %s %c pending\n", to_remote_g2[i].cs, to_remote_g2[i].to_mod);
 			}
 		}
 	}
@@ -937,10 +937,6 @@ void CQnetLink::Process()
 	char tmp1[CALL_SIZE + 1];
 	char tmp2[36]; // 8 for rpt1 + 24 for time_t in std::string format
 	unsigned char dcs_buf[1000];;
-
-	char call[CALL_SIZE + 1];
-	char ip[IP_SIZE + 1];
-	bool found = false;
 
 	char cmd_2_dcs[23];
 	unsigned char dcs_seq[3] = { 0x00, 0x00, 0x00 };
@@ -1011,74 +1007,71 @@ void CQnetLink::Process()
 			send_heartbeat();
 
 			/* send heartbeat to linked XRF repeaters/reflectors */
-			if (to_remote_g2[0].toDst4.sin_port == htons(rmt_xrf_port))
-				sendto(xrf_g2_sock, owner.c_str(), CALL_SIZE+1, 0, (struct sockaddr *)&(to_remote_g2[0].toDst4), sizeof(to_remote_g2[0].toDst4));
+			if (rmt_xrf_port == to_remote_g2[0].addr.GetPort())
+				sendto(xrf_g2_sock, owner.c_str(), CALL_SIZE+1, 0, to_remote_g2[0].addr.GetPointer(), to_remote_g2[0].addr.GetSize());
 
-			if ((to_remote_g2[1].toDst4.sin_port == htons(rmt_xrf_port)) && (strcmp(to_remote_g2[1].to_call, to_remote_g2[0].to_call) != 0))
-				sendto(xrf_g2_sock, owner.c_str(), CALL_SIZE+1, 0, (struct sockaddr *)&(to_remote_g2[1].toDst4), sizeof(to_remote_g2[1].toDst4));
+			if ((rmt_xrf_port == to_remote_g2[1].addr.GetPort()) && (strcmp(to_remote_g2[1].cs, to_remote_g2[0].cs) != 0))
+				sendto(xrf_g2_sock, owner.c_str(), CALL_SIZE+1, 0, to_remote_g2[1].addr.GetPointer(), to_remote_g2[1].addr.GetSize());
 
-			if ((to_remote_g2[2].toDst4.sin_port == htons(rmt_xrf_port)) && (strcmp(to_remote_g2[2].to_call, to_remote_g2[0].to_call) != 0) && (strcmp(to_remote_g2[2].to_call, to_remote_g2[1].to_call) != 0))
-				sendto(xrf_g2_sock, owner.c_str(), CALL_SIZE+1, 0, (struct sockaddr *)&(to_remote_g2[2].toDst4), sizeof(to_remote_g2[2].toDst4));
+			if ((rmt_xrf_port == to_remote_g2[2].addr.GetPort()) && strcmp(to_remote_g2[2].cs, to_remote_g2[0].cs) && strcmp(to_remote_g2[2].cs, to_remote_g2[1].cs))
+				sendto(xrf_g2_sock, owner.c_str(), CALL_SIZE+1, 0, to_remote_g2[2].addr.GetPointer(), to_remote_g2[2].addr.GetSize());
 
 			/* send heartbeat to linked DCS reflectors */
-			if (to_remote_g2[0].toDst4.sin_port == htons(rmt_dcs_port)) {
+			if (rmt_dcs_port == to_remote_g2[0].addr.GetPort()) {
 				strcpy(cmd_2_dcs, owner.c_str());
 				cmd_2_dcs[7] = to_remote_g2[0].from_mod;
-				memcpy(cmd_2_dcs + 9, to_remote_g2[0].to_call, 8);
+				memcpy(cmd_2_dcs + 9, to_remote_g2[0].cs, 8);
 				cmd_2_dcs[16] = to_remote_g2[0].to_mod;
-				sendto(dcs_g2_sock, cmd_2_dcs, 17, 0, (struct sockaddr *)&(to_remote_g2[0].toDst4), sizeof(to_remote_g2[0].toDst4));
+				sendto(dcs_g2_sock, cmd_2_dcs, 17, 0, to_remote_g2[0].addr.GetPointer(), to_remote_g2[0].addr.GetSize());
 			}
-			if (to_remote_g2[1].toDst4.sin_port == htons(rmt_dcs_port)) {
+			if (rmt_dcs_port == to_remote_g2[1].addr.GetPort()) {
 				strcpy(cmd_2_dcs, owner.c_str());
 				cmd_2_dcs[7] = to_remote_g2[1].from_mod;
-				memcpy(cmd_2_dcs + 9, to_remote_g2[1].to_call, 8);
+				memcpy(cmd_2_dcs + 9, to_remote_g2[1].cs, 8);
 				cmd_2_dcs[16] = to_remote_g2[1].to_mod;
-				sendto(dcs_g2_sock, cmd_2_dcs, 17, 0, (struct sockaddr *)&(to_remote_g2[1].toDst4), sizeof(to_remote_g2[1].toDst4));
+				sendto(dcs_g2_sock, cmd_2_dcs, 17, 0, to_remote_g2[1].addr.GetPointer(), to_remote_g2[1].addr.GetSize());
 			}
-			if (to_remote_g2[2].toDst4.sin_port == htons(rmt_dcs_port)) {
+			if (rmt_dcs_port == to_remote_g2[2].addr.GetPort()) {
 				strcpy(cmd_2_dcs, owner.c_str());
 				cmd_2_dcs[7] = to_remote_g2[2].from_mod;
-				memcpy(cmd_2_dcs + 9, to_remote_g2[2].to_call, 8);
+				memcpy(cmd_2_dcs + 9, to_remote_g2[2].cs, 8);
 				cmd_2_dcs[16] = to_remote_g2[2].to_mod;
-				sendto(dcs_g2_sock, cmd_2_dcs, 17, 0, (struct sockaddr *)&(to_remote_g2[2].toDst4), sizeof(to_remote_g2[2].toDst4));
+				sendto(dcs_g2_sock, cmd_2_dcs, 17, 0, to_remote_g2[2].addr.GetPointer(), to_remote_g2[2].addr.GetSize());
 			}
 
 			/* send heartbeat to linked REF reflectors */
-			if (to_remote_g2[0].is_connected && (to_remote_g2[0].toDst4.sin_port == htons(rmt_ref_port)))
-				sendto(ref_g2_sock, REF_ACK, 3, 0, (struct sockaddr *)&(to_remote_g2[0].toDst4), sizeof(to_remote_g2[0].toDst4));
+			if (to_remote_g2[0].is_connected && (rmt_ref_port == to_remote_g2[0].addr.GetPort()))
+				sendto(ref_g2_sock, REF_ACK, 3, 0, to_remote_g2[0].addr.GetPointer(), to_remote_g2[0].addr.GetSize());
 
-			if (to_remote_g2[1].is_connected && (to_remote_g2[1].toDst4.sin_port == htons(rmt_ref_port)) && (strcmp(to_remote_g2[1].to_call, to_remote_g2[0].to_call) != 0))
-				sendto(ref_g2_sock, REF_ACK, 3, 0, (struct sockaddr *)&(to_remote_g2[1].toDst4), sizeof(to_remote_g2[1].toDst4));
+			if (to_remote_g2[1].is_connected && (rmt_ref_port == to_remote_g2[1].addr.GetPort()) && (strcmp(to_remote_g2[1].cs, to_remote_g2[0].cs) != 0))
+				sendto(ref_g2_sock, REF_ACK, 3, 0, to_remote_g2[1].addr.GetPointer(), to_remote_g2[1].addr.GetSize());
 
-			if (to_remote_g2[2].is_connected && (to_remote_g2[2].toDst4.sin_port == htons(rmt_ref_port)) && (strcmp(to_remote_g2[2].to_call, to_remote_g2[0].to_call) != 0) && (strcmp(to_remote_g2[2].to_call, to_remote_g2[1].to_call) != 0))
-				sendto(ref_g2_sock, REF_ACK, 3, 0, (struct sockaddr *)&(to_remote_g2[2].toDst4), sizeof(to_remote_g2[2].toDst4));
+			if (to_remote_g2[2].is_connected && (rmt_ref_port == to_remote_g2[2].addr.GetPort()) && (strcmp(to_remote_g2[2].cs, to_remote_g2[0].cs) != 0) && (strcmp(to_remote_g2[2].cs, to_remote_g2[1].cs) != 0))
+				sendto(ref_g2_sock, REF_ACK, 3, 0, to_remote_g2[2].addr.GetPointer(), to_remote_g2[2].addr.GetSize());
 
 			for (int i=0; i<3; i++) {
 				/* check for timeouts from remote */
-				if (to_remote_g2[i].to_call[0] != '\0') {
+				if (to_remote_g2[i].cs[0] != '\0') {
 					if (to_remote_g2[i].countdown >= 0)
 						to_remote_g2[i].countdown--;
 
 					if (to_remote_g2[i].countdown < 0) {
 						/* maybe remote system has changed IP */
-						printf("Unlinked from [%s] mod %c, TIMEOUT...\n", to_remote_g2[i].to_call, to_remote_g2[i].to_mod);
-
+						printf("Unlinked from [%s] mod %c, TIMEOUT...\n", to_remote_g2[i].cs, to_remote_g2[i].to_mod);
+						qnDB.DeleteLS(to_remote_g2[i].addr.GetAddress());
 						sprintf(notify_msg[i], "%c_unlinked.dat_LINK_TIMEOUT", to_remote_g2[i].from_mod);
 
-						if (auto_link[i]) {
-							std::string stmp(to_remote_g2[i].to_call);
+						if (to_remote_g2[i].auto_link) {
+							std::string stmp(to_remote_g2[i].cs);
 							g2link(to_remote_g2[i].from_mod, stmp.c_str(), to_remote_g2[i].to_mod);
 						} else {
-							to_remote_g2[i].to_call[0] = '\0';
-							memset(&(to_remote_g2[i].toDst4),0,sizeof(struct sockaddr_in));
+							to_remote_g2[i].cs[0] = '\0';
+							to_remote_g2[i].addr.Clear();
 							to_remote_g2[i].from_mod = to_remote_g2[i].to_mod = ' ';
 							to_remote_g2[i].countdown = 0;
 							to_remote_g2[i].is_connected = false;
 							to_remote_g2[i].in_streamid = 0x0;
 						}
-
-						print_status_file();
-
 					}
 				}
 
@@ -1087,23 +1080,23 @@ void CQnetLink::Process()
 					if (((tnow - tracing[i].last_time) > rf_inactivity_timer[i]) && (rf_inactivity_timer[i] > 0)) {
 						tracing[i].last_time = 0;
 
-						printf("Unlinked from [%s] mod %c, local RF inactivity...\n", to_remote_g2[i].to_call, to_remote_g2[i].to_mod);
+						printf("Unlinked from [%s] mod %c, local RF inactivity...\n", to_remote_g2[i].cs, to_remote_g2[i].to_mod);
 
-						if (to_remote_g2[i].toDst4.sin_port == htons(rmt_ref_port)) {
+						if (rmt_ref_port == to_remote_g2[i].addr.GetPort()) {
 							queryCommand[0] = 5;
 							queryCommand[1] = 0;
 							queryCommand[2] = 24;
 							queryCommand[3] = 0;
 							queryCommand[4] = 0;
-							sendto(ref_g2_sock, queryCommand, 5, 0, (struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(to_remote_g2[i].toDst4));
+							sendto(ref_g2_sock, queryCommand, 5, 0, to_remote_g2[i].addr.GetPointer(), to_remote_g2[i].addr.GetSize());
 
 							/* zero out any other entries here that match that system */
 							for (int j=0; j<3; j++) {
 								if (j != i) {
-									if ((to_remote_g2[j].toDst4.sin_addr.s_addr == to_remote_g2[i].toDst4.sin_addr.s_addr) &&
-									        (to_remote_g2[j].toDst4.sin_port == htons(rmt_ref_port))) {
-										to_remote_g2[j].to_call[0] = '\0';
-										memset(&(to_remote_g2[j].toDst4),0,sizeof(struct sockaddr_in));
+									std::string a(to_remote_g2[j].addr.GetAddress());
+									if (0==a.compare(to_remote_g2[i].addr.GetAddress()) && (rmt_ref_port == to_remote_g2[j].addr.GetPort())) {
+										to_remote_g2[j].cs[0] = '\0';
+										to_remote_g2[j].addr.Clear();
 										to_remote_g2[j].from_mod = ' ';
 										to_remote_g2[j].to_mod = ' ';
 										to_remote_g2[j].countdown = 0;
@@ -1112,35 +1105,33 @@ void CQnetLink::Process()
 									}
 								}
 							}
-						} else if (to_remote_g2[i].toDst4.sin_port == htons(rmt_xrf_port)) {
+						} else if (rmt_xrf_port == to_remote_g2[i].addr.GetPort()) {
 							strcpy(unlink_request, owner.c_str());
 							unlink_request[8] = to_remote_g2[i].from_mod;
 							unlink_request[9] = ' ';
 							unlink_request[10] = '\0';
 
 							for (int j=0; j<5; j++)
-								sendto(xrf_g2_sock, unlink_request, CALL_SIZE+3, 0, (struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(to_remote_g2[i].toDst4));
-						} else if (to_remote_g2[i].toDst4.sin_port == htons(rmt_dcs_port)) {
+								sendto(xrf_g2_sock, unlink_request, CALL_SIZE+3, 0, to_remote_g2[i].addr.GetPointer(), to_remote_g2[i].addr.GetSize());
+						} else if (rmt_dcs_port == to_remote_g2[i].addr.GetPort()) {
 							strcpy(cmd_2_dcs, owner.c_str());
 							cmd_2_dcs[8] = to_remote_g2[i].from_mod;
 							cmd_2_dcs[9] = ' ';
 							cmd_2_dcs[10] = '\0';
-							memcpy(cmd_2_dcs + 11, to_remote_g2[i].to_call, 8);
+							memcpy(cmd_2_dcs + 11, to_remote_g2[i].cs, 8);
 
 							for (int j=0; j<2; j++)
-								sendto(dcs_g2_sock, cmd_2_dcs, 19 ,0, (struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(to_remote_g2[i].toDst4));
+								sendto(dcs_g2_sock, cmd_2_dcs, 19 ,0, to_remote_g2[i].addr.GetPointer(), to_remote_g2[i].addr.GetSize());
 						}
 
 						sprintf(notify_msg[i], "%c_unlinked.dat_UNLINKED_TIMEOUT", to_remote_g2[i].from_mod);
-
-						to_remote_g2[i].to_call[0] = '\0';
-						memset(&(to_remote_g2[i].toDst4),0,sizeof(struct sockaddr_in));
+						qnDB.DeleteLS(to_remote_g2[i].addr.GetAddress());
+						to_remote_g2[i].cs[0] = '\0';
+						to_remote_g2[i].addr.Clear();
 						to_remote_g2[i].from_mod = to_remote_g2[i].to_mod = ' ';
 						to_remote_g2[i].countdown = 0;
 						to_remote_g2[i].is_connected = false;
 						to_remote_g2[i].in_streamid = 0x0;
-
-						print_status_file();
 					}
 				}
 			}
@@ -1169,41 +1160,40 @@ void CQnetLink::Process()
 		}
 
 		FD_ZERO(&fdset);
-		FD_SET(xrf_g2_sock,&fdset);
-		FD_SET(dcs_g2_sock,&fdset);
-		FD_SET(ref_g2_sock,&fdset);
-		FD_SET(rptr_sock,&fdset);
+		FD_SET(xrf_g2_sock, &fdset);
+		FD_SET(dcs_g2_sock, &fdset);
+		FD_SET(ref_g2_sock, &fdset);
+		FD_SET(rptr_sock,   &fdset);
 		tv.tv_sec = 0;
 		tv.tv_usec = 20000;
 		(void)select(max_nfds + 1,&fdset,0,0,&tv);
 
 		if (FD_ISSET(xrf_g2_sock, &fdset)) {
-			socklen_t fromlen = sizeof(struct sockaddr_in);
+			socklen_t fromlen = sizeof(struct sockaddr_storage);
 			unsigned char buf[100];
-			int length = recvfrom(xrf_g2_sock, buf, 100, 0, (struct sockaddr *)&fromDst4, &fromlen);
+			int length = recvfrom(xrf_g2_sock, buf, 100, 0, fromDst4.GetPointer(), &fromlen);
 
-			strncpy(ip, inet_ntoa(fromDst4.sin_addr), IP_SIZE);
-			ip[IP_SIZE] = '\0';
-			memcpy(call, buf, CALL_SIZE);
-			call[CALL_SIZE] = '\0';
+			const std::string addr(fromDst4.GetAddress());
+			const std::string user((char *)buf, 8);
 
 			/* A packet of length (CALL_SIZE + 1) is a keepalive from a repeater/reflector */
 			/* If it is from a dongle, it is either a keepalive or a request to connect */
 
+			bool found = false;
 			if (length == (CALL_SIZE + 1)) {
 				found = false;
 				/* Find out if it is a keepalive from a repeater */
 				for (int i=0; i<3; i++) {
-					if (fromDst4.sin_addr.s_addr==to_remote_g2[i].toDst4.sin_addr.s_addr && to_remote_g2[i].toDst4.sin_port==htons(rmt_xrf_port)) {
+					if (0 == addr.compare(to_remote_g2[i].addr.GetAddress()) && (rmt_xrf_port == to_remote_g2[i].addr.GetPort())) {
 						found = true;
 						if (!to_remote_g2[i].is_connected) {
 							tracing[i].last_time = time(NULL);
 
 							to_remote_g2[i].is_connected = true;
 							printf("Connected from: %.*s\n", length - 1, buf);
-							print_status_file();
+							qnDB.UpdateLS(addr.c_str(), to_remote_g2[i].from_mod, to_remote_g2[i].cs, to_remote_g2[i].to_mod, tracing[i].last_time);
 
-							strcpy(linked_remote_system, to_remote_g2[i].to_call);
+							strcpy(linked_remote_system, to_remote_g2[i].cs);
 							space_p = strchr(linked_remote_system, ' ');
 							if (space_p)
 								*space_p = '\0';
@@ -1218,34 +1208,32 @@ void CQnetLink::Process()
 				/* Because we sent a request before asking to link */
 
 				for (int i=0; i<3; i++) {
-					if ((fromDst4.sin_addr.s_addr == to_remote_g2[i].toDst4.sin_addr.s_addr) && (to_remote_g2[i].toDst4.sin_port == htons(rmt_xrf_port))) {
+					if ((0 == addr.compare(to_remote_g2[i].addr.GetAddress())) && (rmt_xrf_port == to_remote_g2[i].addr.GetPort())) {
 						if (0==memcmp(buf + 10, "ACK", 3) && to_remote_g2[i].from_mod==buf[8]) {
 							if (!to_remote_g2[i].is_connected) {
 								tracing[i].last_time = time(NULL);
 
 								to_remote_g2[i].is_connected = true;
-								printf("Connected from: [%s] %c\n", to_remote_g2[i].to_call, to_remote_g2[i].to_mod);
-								print_status_file();
+								printf("Connected from: [%s] %c\n", to_remote_g2[i].cs, to_remote_g2[i].to_mod);
+								qnDB.UpdateLS(addr.c_str(), to_remote_g2[i].from_mod, to_remote_g2[i].cs, to_remote_g2[i].to_mod, tracing[i].last_time);
 
-								strcpy(linked_remote_system, to_remote_g2[i].to_call);
+								strcpy(linked_remote_system, to_remote_g2[i].cs);
 								space_p = strchr(linked_remote_system, ' ');
 								if (space_p)
 									*space_p = '\0';
 								sprintf(notify_msg[i], "%c_linked.dat_LINKED_%s_%c", to_remote_g2[i].from_mod, linked_remote_system, to_remote_g2[i].to_mod);
 							}
 						} else if (0==memcmp(buf + 10, "NAK", 3) && to_remote_g2[i].from_mod==buf[8]) {
-							printf("Link module %c to [%s] %c is rejected\n", to_remote_g2[i].from_mod, to_remote_g2[i].to_call, to_remote_g2[i].to_mod);
+							printf("Link module %c to [%s] %c is rejected\n", to_remote_g2[i].from_mod, to_remote_g2[i].cs, to_remote_g2[i].to_mod);
 
 							sprintf(notify_msg[i], "%c_failed_link.dat_FAILED_TO_LINK", to_remote_g2[i].from_mod);
-
-							to_remote_g2[i].to_call[0] = '\0';
-							memset(&(to_remote_g2[i].toDst4),0,sizeof(struct sockaddr_in));
+							qnDB.DeleteLS(to_remote_g2[i].addr.GetAddress());
+							to_remote_g2[i].cs[0] = '\0';
+							to_remote_g2[i].addr.Clear();
 							to_remote_g2[i].from_mod = to_remote_g2[i].to_mod = ' ';
 							to_remote_g2[i].countdown = 0;
 							to_remote_g2[i].is_connected = false;
 							to_remote_g2[i].in_streamid = 0x0;
-
-							print_status_file();
 						}
 					}
 				}
@@ -1255,24 +1243,22 @@ void CQnetLink::Process()
 
 				/* Check our linked repeaters/reflectors */
 				for (int i=0; i<3; i++) {
-					if (fromDst4.sin_addr.s_addr==to_remote_g2[i].toDst4.sin_addr.s_addr && to_remote_g2[i].toDst4.sin_port==htons(rmt_xrf_port)) {
+					if ((0 == addr.compare(to_remote_g2[i].addr.GetAddress())) && (rmt_xrf_port == to_remote_g2[i].addr.GetPort())) {
 						if (to_remote_g2[i].to_mod == buf[8]) {
 							/* unlink request from remote repeater that we know */
 							if (buf[9] == ' ') {
 								printf("Received: %.*s\n", length - 1, buf);
-								printf("Module %c to [%s] %c is unlinked\n", to_remote_g2[i].from_mod, to_remote_g2[i].to_call, to_remote_g2[i].to_mod);
+								printf("Module %c to [%s] %c is unlinked\n", to_remote_g2[i].from_mod, to_remote_g2[i].cs, to_remote_g2[i].to_mod);
 
 								sprintf(notify_msg[i], "%c_unlinked.dat_UNLINKED", to_remote_g2[i].from_mod);
-
-								to_remote_g2[i].to_call[0] = '\0';
-								memset(&(to_remote_g2[i].toDst4),0,sizeof(struct sockaddr_in));
+								qnDB.DeleteLS(to_remote_g2[i].addr.GetAddress());
+								to_remote_g2[i].cs[0] = '\0';
+								to_remote_g2[i].addr.Clear();
 								to_remote_g2[i].from_mod = to_remote_g2[i].to_mod = ' ';
 								to_remote_g2[i].countdown = 0;
 								to_remote_g2[i].is_connected = false;
 								to_remote_g2[i].in_streamid = 0x0;
-
-								print_status_file();
-							} else
+							} else {
 								/* link request from a remote repeater that we know */
 								if ((i==0 && buf[9]=='A') || (i==1 && buf[9]=='B') || (i==2 && buf[9]=='C')) {
 
@@ -1284,35 +1270,33 @@ void CQnetLink::Process()
 
 									printf("Received: %.*s\n", length - 1, buf);
 
-									memcpy(to_remote_g2[i].to_call, buf, CALL_SIZE);
-									to_remote_g2[i].to_call[CALL_SIZE] = '\0';
-									memcpy(&(to_remote_g2[i].toDst4), &fromDst4, sizeof(struct sockaddr_in));
-									to_remote_g2[i].toDst4.sin_port = htons(rmt_xrf_port);
+									memcpy(to_remote_g2[i].cs, buf, CALL_SIZE);
+									to_remote_g2[i].cs[CALL_SIZE] = '\0';
+									to_remote_g2[i].addr.Initialize(fromDst4.GetFamily(), rmt_xrf_port, fromDst4.GetAddress());
 									to_remote_g2[i].to_mod = buf[8];
 									to_remote_g2[i].countdown = TIMEOUT;
 									to_remote_g2[i].is_connected = true;
 									to_remote_g2[i].in_streamid = 0x0;
-
-									printf("Module %c to [%s] %c linked\n", buf[9], to_remote_g2[i].to_call, to_remote_g2[i].to_mod);
-
+									to_remote_g2[i].from_mod = buf[9];
 									tracing[i].last_time = time(NULL);
-
-									print_status_file();
+									qnDB.UpdateLS(fromDst4.GetAddress(), to_remote_g2[i].from_mod, to_remote_g2[i].cs, to_remote_g2[i].to_mod, tracing[i].last_time);
+									printf("Module %c to [%s] %c linked\n", buf[9], to_remote_g2[i].cs, to_remote_g2[i].to_mod);
 
 									/* send back an ACK */
 									memcpy(buf + 10, "ACK", 4);
-									sendto(xrf_g2_sock, buf, CALL_SIZE+6, 0, (struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(struct sockaddr_in));
+									sendto(xrf_g2_sock, buf, CALL_SIZE+6, 0, to_remote_g2[i].addr.GetPointer(), to_remote_g2[i].addr.GetSize());
 
 									if (to_remote_g2[i].from_mod != buf[9]) {
 										to_remote_g2[i].from_mod = buf[9];
 
-										strcpy(linked_remote_system, to_remote_g2[i].to_call);
+										strcpy(linked_remote_system, to_remote_g2[i].cs);
 										space_p = strchr(linked_remote_system, ' ');
 										if (space_p)
 											*space_p = '\0';
 										sprintf(notify_msg[i], "%c_linked.dat_LINKED_%s_%c", to_remote_g2[i].from_mod, linked_remote_system, to_remote_g2[i].to_mod);
 									}
 								}
+							}
 						}
 					}
 				}
@@ -1328,15 +1312,15 @@ void CQnetLink::Process()
 					i = 2;
 
 				/* Is this repeater listed in gwys.txt? */
-				auto gwy_pos = gwy_list.find(call);
+				auto gwy_pos = gwy_list.find(user);
 				if (gwy_pos == gwy_list.end()) {
 					/* We did NOT find this repeater in gwys.txt, reject the incoming link request */
-					printf("Incoming link from %s,%s but not found in gwys.txt\n", call, ip);
+					printf("Incoming link from %s,%s but not found in gwys.txt\n", user.c_str(), addr.c_str());
 					i = -1;
 				} else {
-					int rc = regexec(&preg, call, 0, NULL, 0);
+					int rc = regexec(&preg, user.c_str(), 0, NULL, 0);
 					if (rc != 0) {
-						printf("Invalid repeater %s,%s requesting to link\n", call, ip);
+						printf("Invalid repeater %s,%s requesting to link\n", user.c_str(), addr.c_str());
 						i = -1;
 					}
 				}
@@ -1352,24 +1336,21 @@ void CQnetLink::Process()
 							*/
 
 							/* now it can be added as a repeater */
-							strcpy(to_remote_g2[i].to_call, call);
-							to_remote_g2[i].to_call[CALL_SIZE] = '\0';
-							memcpy(&(to_remote_g2[i].toDst4), &fromDst4, sizeof(struct sockaddr_in));
-							to_remote_g2[i].toDst4.sin_port = htons(rmt_xrf_port);
+							strcpy(to_remote_g2[i].cs, user.c_str());
+							to_remote_g2[i].cs[CALL_SIZE] = '\0';
+							to_remote_g2[i].addr.Initialize(fromDst4.GetFamily(), rmt_xrf_port, fromDst4.GetAddress());
 							to_remote_g2[i].from_mod = buf[9];
 							to_remote_g2[i].to_mod = buf[8];
 							to_remote_g2[i].countdown = TIMEOUT;
 							to_remote_g2[i].is_connected = true;
 							to_remote_g2[i].in_streamid = 0x0;
-
-							print_status_file();
-
 							tracing[i].last_time = time(NULL);
+							qnDB.UpdateLS(fromDst4.GetAddress(), to_remote_g2[i].from_mod, to_remote_g2[i].cs, to_remote_g2[i].to_mod, tracing[i].last_time);
 
 							printf("Received: %.*s\n", length - 1, buf);
-							printf("Module %c to [%s] %c linked\n", to_remote_g2[i].from_mod, to_remote_g2[i].to_call, to_remote_g2[i].to_mod);
+							printf("Module %c to [%s] %c linked\n", to_remote_g2[i].from_mod, to_remote_g2[i].cs, to_remote_g2[i].to_mod);
 
-							strcpy(linked_remote_system, to_remote_g2[i].to_call);
+							strcpy(linked_remote_system, to_remote_g2[i].cs);
 							space_p = strchr(linked_remote_system, ' ');
 							if (space_p)
 								*space_p = '\0';
@@ -1377,13 +1358,13 @@ void CQnetLink::Process()
 
 							/* send back an ACK */
 							memcpy(buf + 10, "ACK", 4);
-							sendto(xrf_g2_sock, buf, CALL_SIZE+6, 0, (struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(struct sockaddr_in));
+							sendto(xrf_g2_sock, buf, CALL_SIZE+6, 0, to_remote_g2[i].addr.GetPointer(), sizeof(struct sockaddr_in));
 						}
 					} else {
-						if (fromDst4.sin_addr.s_addr != to_remote_g2[i].toDst4.sin_addr.s_addr) {
+						if (addr.compare(to_remote_g2[i].addr.GetAddress())) {
 							/* Our repeater module is linked to another repeater-reflector */
 							memcpy(buf + 10, "NAK", 4);
-							fromDst4.sin_port = htons(rmt_xrf_port);
+							fromDst4.Initialize(fromDst4.GetFamily(), rmt_xrf_port, fromDst4.GetAddress());
 							sendto(xrf_g2_sock, buf, CALL_SIZE+6, 0, (struct sockaddr *)&fromDst4, sizeof(struct sockaddr_in));
 						}
 					}
@@ -1393,7 +1374,7 @@ void CQnetLink::Process()
 
 				found = false;
 				for (int i=0; i<3; i++) {
-					if ((fromDst4.sin_addr.s_addr == to_remote_g2[i].toDst4.sin_addr.s_addr) && (to_remote_g2[i].toDst4.sin_port == htons(rmt_xrf_port))) {
+					if ((0 == addr.compare(to_remote_g2[i].addr.GetAddress())) && (rmt_xrf_port == to_remote_g2[i].addr.GetPort())) {
 						to_remote_g2[i].countdown = TIMEOUT;
 						found = true;
 					}
@@ -1407,26 +1388,27 @@ void CQnetLink::Process()
 					source_stn[8] = '\0';
 
 					/* some bad hotspot programs out there using INCORRECT flag */
-					if (dsvt.hdr.flag[0]==0x40U || dsvt.hdr.flag[0]==0x48U || dsvt.hdr.flag[0]==0x60U || dsvt.hdr.flag[0]==0x68U) dsvt.hdr.flag[0] -= 0x40;
+					if (dsvt.hdr.flag[0]==0x40U || dsvt.hdr.flag[0]==0x48U || dsvt.hdr.flag[0]==0x60U || dsvt.hdr.flag[0]==0x68U)
+						dsvt.hdr.flag[0] -= 0x40U;
 
 					/* A reflector will send to us its own RPT1 */
 					/* A repeater will send to us our RPT1 */
 
 					for (int i=0; i<3; i++) {
-						if (fromDst4.sin_addr.s_addr==to_remote_g2[i].toDst4.sin_addr.s_addr && to_remote_g2[i].toDst4.sin_port==htons(rmt_xrf_port)) {
+						if ((0 == addr.compare(to_remote_g2[i].addr.GetAddress())) && (rmt_xrf_port == to_remote_g2[i].addr.GetPort())) {
 							/* it is a reflector, reflector's rpt1 */
-							if (0==memcmp(dsvt.hdr.rpt1, to_remote_g2[i].to_call, 7) && dsvt.hdr.rpt1[7]==to_remote_g2[i].to_mod) {
+							if (0==memcmp(dsvt.hdr.rpt1, to_remote_g2[i].cs, 7) && dsvt.hdr.rpt1[7]==to_remote_g2[i].to_mod) {
 								memcpy(dsvt.hdr.rpt1, owner.c_str(), CALL_SIZE);
 								dsvt.hdr.rpt1[7] = to_remote_g2[i].from_mod;
 								memcpy(dsvt.hdr.urcall, "CQCQCQ  ", 8);
 
-								memcpy(source_stn, to_remote_g2[i].to_call, 8);
+								memcpy(source_stn, to_remote_g2[i].cs, 8);
 								source_stn[7] = to_remote_g2[i].to_mod;
 								break;
 							} else
 								/* it is a repeater, our rpt1 */
 								if (memcmp(dsvt.hdr.rpt1, owner.c_str(), CALL_SIZE-1) && dsvt.hdr.rpt1[7]==to_remote_g2[i].from_mod) {
-									memcpy(source_stn, to_remote_g2[i].to_call, 8);
+									memcpy(source_stn, to_remote_g2[i].cs, 8);
 									source_stn[7] = to_remote_g2[i].to_mod;
 									break;
 								}
@@ -1455,7 +1437,7 @@ void CQnetLink::Process()
 						/* Last Heard */
 						if (old_sid[i].sid != dsvt.streamid) {
 							if (qso_details)
-								printf("START from remote g2: streamID=%04x, flags=%02x:%02x:%02x, my=%.8s, sfx=%.4s, ur=%.8s, rpt1=%.8s, rpt2=%.8s, %d bytes fromIP=%s, source=%.8s\n", ntohs(dsvt.streamid), dsvt.hdr.flag[0], dsvt.hdr.flag[1], dsvt.hdr.flag[2], dsvt.hdr.mycall, dsvt.hdr.sfx, dsvt.hdr.urcall, dsvt.hdr.rpt1, dsvt.hdr.rpt2, length, inet_ntoa(fromDst4.sin_addr), source_stn);
+								printf("START from remote g2: streamID=%04x, flags=%02x:%02x:%02x, my=%.8s, sfx=%.4s, ur=%.8s, rpt1=%.8s, rpt2=%.8s, %d bytes fromIP=%s, source=%.8s\n", ntohs(dsvt.streamid), dsvt.hdr.flag[0], dsvt.hdr.flag[1], dsvt.hdr.flag[2], dsvt.hdr.mycall, dsvt.hdr.sfx, dsvt.hdr.urcall, dsvt.hdr.rpt1, dsvt.hdr.rpt2, length, fromDst4.GetAddress(), source_stn);
 
 							// put user into tmp1
 							memcpy(tmp1, dsvt.hdr.mycall, 8);
@@ -1482,20 +1464,20 @@ void CQnetLink::Process()
 						}
 
 						/* relay data to our local G2 */
-						sendto(rptr_sock, dsvt.title, 56, 0, (struct sockaddr *)&toLocalg2, sizeof(struct sockaddr_in));
+						sendto(rptr_sock, dsvt.title, 56, 0, toLocalg2.GetPointer(), toLocalg2.GetSize());
 
 						/* send data to donglers */
 						/* no changes here */
 						for (auto pos = inbound_list.begin(); pos != inbound_list.end(); pos++) {
 							SINBOUND *inbound = (SINBOUND *)pos->second;
-							if (fromDst4.sin_addr.s_addr != inbound->sin.sin_addr.s_addr) {
+							if (addr.compare(inbound->addr.GetAddress())) {
 								SREFDSVT rdsvt;
 								rdsvt.head[0] = (unsigned char)(58 & 0xFF);
 								rdsvt.head[1] = (unsigned char)(58 >> 8 & 0x1F);
 								rdsvt.head[1] = (unsigned char)(rdsvt.head[1] | 0xFFFFFF80);
 								memcpy(rdsvt.dsvt.title, dsvt.title, 56);
 
-								sendto(ref_g2_sock, rdsvt.head, 58, 0, (struct sockaddr *)&(inbound->sin), sizeof(struct sockaddr_in));
+								sendto(ref_g2_sock, rdsvt.head, 58, 0, inbound->addr.GetPointer(), sizeof(struct sockaddr_in));
 							} else
 								inbound->mod = dsvt.hdr.rpt1[7];
 						}
@@ -1513,12 +1495,12 @@ void CQnetLink::Process()
 							/* We can only enter this loop up to 2 times max */
 							for (int j=k; j<3; j++) {
 								/* it is a remote gateway, not a dongle user */
-								if (fromDst4.sin_addr.s_addr==to_remote_g2[j].toDst4.sin_addr.s_addr &&
+								if ((0 == addr.compare(to_remote_g2[j].addr.GetAddress())) &&
 										/* it is xrf */
-										to_remote_g2[j].toDst4.sin_port==htons(rmt_xrf_port) &&
-										0==memcmp(to_remote_g2[j].to_call, "XRF", 3) &&
+										(rmt_xrf_port == to_remote_g2[j].addr.GetPort()) &&
+										0==memcmp(to_remote_g2[j].cs, "XRF", 3) &&
 										/* it is the same xrf and xrf module */
-										0==memcmp(to_remote_g2[j].to_call, to_remote_g2[i].to_call, 8) &&
+										0==memcmp(to_remote_g2[j].cs, to_remote_g2[i].cs, 8) &&
 										to_remote_g2[j].to_mod==to_remote_g2[i].to_mod) {
 									/* send the packet to another module of our local repeater: this is multi-link */
 
@@ -1537,7 +1519,7 @@ void CQnetLink::Process()
 									calcPFCS(from_xrf_torptr_brd.title, 56);
 
 									/* send the data to the local gateway/repeater */
-									sendto(rptr_sock, from_xrf_torptr_brd.title, 56, 0, (struct sockaddr *)&toLocalg2, sizeof(struct sockaddr_in));
+									sendto(rptr_sock, from_xrf_torptr_brd.title, 56, 0, toLocalg2.GetPointer(), toLocalg2.GetSize());
 
 									/* save streamid for use with the audio packets that will arrive after this header */
 
@@ -1548,8 +1530,8 @@ void CQnetLink::Process()
 							}
 						}
 
-						if (to_remote_g2[i].toDst4.sin_addr.s_addr!=fromDst4.sin_addr.s_addr && to_remote_g2[i].is_connected) {
-							if (to_remote_g2[i].toDst4.sin_port == htons(rmt_xrf_port)) {
+						if (addr.compare(to_remote_g2[i].addr.GetAddress()) && to_remote_g2[i].is_connected) {
+							if (rmt_xrf_port == to_remote_g2[i].addr.GetPort()) {
 								if ( /*** (memcmp(readBuffer2 + 42, owner, 8) != 0) && ***/         /* block repeater announcements */
 									(memcmp(dsvt.hdr.urcall, "CQCQCQ", 6) == 0) && /* CQ calls only */
 									(dsvt.hdr.flag[0] == 0x00  ||                  /* normal */
@@ -1563,15 +1545,15 @@ void CQnetLink::Process()
 									/* inform XRF about the source */
 									dsvt.flagb[2] = to_remote_g2[i].from_mod;
 
-									memcpy(dsvt.hdr.rpt1, to_remote_g2[i].to_call, CALL_SIZE);
+									memcpy(dsvt.hdr.rpt1, to_remote_g2[i].cs, CALL_SIZE);
 									dsvt.hdr.rpt1[7] = to_remote_g2[i].to_mod;
-									memcpy(dsvt.hdr.rpt2, to_remote_g2[i].to_call, CALL_SIZE);
+									memcpy(dsvt.hdr.rpt2, to_remote_g2[i].cs, CALL_SIZE);
 									dsvt.hdr.rpt2[7] = 'G';
 									calcPFCS(dsvt.title, 56);
 
-									sendto(xrf_g2_sock, dsvt.title, 56, 0, (struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(struct sockaddr_in));
+									sendto(xrf_g2_sock, dsvt.title, 56, 0, to_remote_g2[i].addr.GetPointer(), sizeof(struct sockaddr_in));
 								}
-							} else if (to_remote_g2[i].toDst4.sin_port == htons(rmt_ref_port)) {
+							} else if (rmt_ref_port == to_remote_g2[i].addr.GetPort()) {
 								if ( /*** (memcmp(readBuffer2 + 42, owner, 8) != 0) && ***/         /* block repeater announcements */
 											0==memcmp(dsvt.hdr.urcall, "CQCQCQ", 6) && /* CQ calls only */
 											(dsvt.hdr.flag[0] == 0x00 ||               /* normal */
@@ -1590,18 +1572,18 @@ void CQnetLink::Process()
 									memcpy(rdsvt.dsvt.title, dsvt.title, 56);
 
 									memset(rdsvt.dsvt.hdr.rpt1, ' ', CALL_SIZE);
-									memcpy(rdsvt.dsvt.hdr.rpt1, to_remote_g2[i].to_call, strlen(to_remote_g2[i].to_call));
+									memcpy(rdsvt.dsvt.hdr.rpt1, to_remote_g2[i].cs, strlen(to_remote_g2[i].cs));
 									rdsvt.dsvt.hdr.rpt1[7] = to_remote_g2[i].to_mod;
 									memset(rdsvt.dsvt.hdr.rpt2, ' ', CALL_SIZE);
-									memcpy(rdsvt.dsvt.hdr.rpt2, to_remote_g2[i].to_call, strlen(to_remote_g2[i].to_call));
+									memcpy(rdsvt.dsvt.hdr.rpt2, to_remote_g2[i].cs, strlen(to_remote_g2[i].cs));
 									rdsvt.dsvt.hdr.rpt2[7] = 'G';
 									memcpy(rdsvt.dsvt.hdr.urcall, "CQCQCQ  ", CALL_SIZE);
 
 									calcPFCS(rdsvt.dsvt.title, 56);
 
-									sendto(ref_g2_sock, rdsvt.head, 58, 0, (struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(struct sockaddr_in));
+									sendto(ref_g2_sock, rdsvt.head, 58, 0, to_remote_g2[i].addr.GetPointer(), sizeof(struct sockaddr_in));
 								}
-							} else if (to_remote_g2[i].toDst4.sin_port == htons(rmt_dcs_port)) {
+							} else if (rmt_dcs_port == to_remote_g2[i].addr.GetPort()) {
 								if ( /*** (memcmp(readBuffer2 + 42, owner, 8) != 0) && ***/         /* block repeater announcements */
 										0==memcmp(dsvt.hdr.urcall, "CQCQCQ", 6) && /* CQ calls only */
 										(dsvt.hdr.flag[0] == 0x00 ||               /* normal */
@@ -1624,7 +1606,7 @@ void CQnetLink::Process()
 						for (int i=0; i<3; i++) {
 							if (old_sid[i].sid == dsvt.streamid) {
 								if (qso_details)
-									printf("END from remote g2: streamID=%04x, %d bytes from IP=%s\n", ntohs(dsvt.streamid), length, inet_ntoa(fromDst4.sin_addr));
+									printf("END from remote g2: streamID=%04x, %d bytes from IP=%s\n", ntohs(dsvt.streamid), length, fromDst4.GetAddress());
 								old_sid[i].sid = 0x0;
 
 								break;
@@ -1633,13 +1615,13 @@ void CQnetLink::Process()
 					}
 
 					/* relay data to our local G2 */
-					sendto(rptr_sock, dsvt.title, 27, 0, (struct sockaddr *)&toLocalg2, sizeof(struct sockaddr_in));
+					sendto(rptr_sock, dsvt.title, 27, 0, toLocalg2.GetPointer(), toLocalg2.GetSize());
 
 					/* send data to donglers */
 					/* no changes here */
 					for (auto pos = inbound_list.begin(); pos != inbound_list.end(); pos++) {
 						SINBOUND *inbound = (SINBOUND *)pos->second;
-						if (fromDst4.sin_addr.s_addr != inbound->sin.sin_addr.s_addr) {
+						if (addr.compare(inbound->addr.GetAddress())) {
 							SREFDSVT rdsvt;
 							rdsvt.head[0] = (unsigned char)(29 & 0xFF);
 							rdsvt.head[1] = (unsigned char)(29 >> 8 & 0x1F);
@@ -1647,7 +1629,7 @@ void CQnetLink::Process()
 
 							memcpy(rdsvt.dsvt.title, dsvt.title, 27);
 
-							sendto(ref_g2_sock, rdsvt.head, 29, 0, (struct sockaddr *)&(inbound->sin), sizeof(struct sockaddr_in));
+							sendto(ref_g2_sock, rdsvt.head, 29, 0, inbound->addr.GetPointer(), sizeof(struct sockaddr_in));
 						}
 					}
 
@@ -1657,12 +1639,12 @@ void CQnetLink::Process()
 
 						if (brd_from_xrf.rptr_streamid[0] != 0x0) {
 							from_xrf_torptr_brd.streamid = brd_from_xrf.rptr_streamid[0];
-							sendto(rptr_sock, from_xrf_torptr_brd.title, 27, 0, (struct sockaddr *)&toLocalg2, sizeof(struct sockaddr_in));
+							sendto(rptr_sock, from_xrf_torptr_brd.title, 27, 0, toLocalg2.GetPointer(), toLocalg2.GetSize());
 						}
 
 						if (brd_from_xrf.rptr_streamid[1] != 0x0) {
 							from_xrf_torptr_brd.streamid = brd_from_xrf.rptr_streamid[1];
-							sendto(rptr_sock, from_xrf_torptr_brd.title, 27, 0, (struct sockaddr *)&toLocalg2, sizeof(struct sockaddr_in));
+							sendto(rptr_sock, from_xrf_torptr_brd.title, 27, 0, toLocalg2.GetPointer(), toLocalg2.GetSize());
 						}
 
 						if (dsvt.ctrl & 0x40) {
@@ -1672,13 +1654,13 @@ void CQnetLink::Process()
 					}
 
 					for (int i=0; i<3; i++) {
-						if (to_remote_g2[i].is_connected && to_remote_g2[i].toDst4.sin_addr.s_addr!=fromDst4.sin_addr.s_addr && to_remote_g2[i].in_streamid==dsvt.streamid) {
-							if (to_remote_g2[i].toDst4.sin_port == htons(rmt_xrf_port)) {
+						if (to_remote_g2[i].is_connected && addr.compare(to_remote_g2[i].addr.GetAddress()) && to_remote_g2[i].in_streamid==dsvt.streamid) {
+							if (rmt_xrf_port == to_remote_g2[i].addr.GetPort()) {
 								/* inform XRF about the source */
 								dsvt.flagb[2] = to_remote_g2[i].from_mod;
 
-								sendto(xrf_g2_sock, dsvt.title, 27, 0, (struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(struct sockaddr_in));
-							} else if (to_remote_g2[i].toDst4.sin_port == htons(rmt_ref_port)) {
+								sendto(xrf_g2_sock, dsvt.title, 27, 0, to_remote_g2[i].addr.GetPointer(), sizeof(struct sockaddr_in));
+							} else if (rmt_ref_port == to_remote_g2[i].addr.GetPort()) {
 								SREFDSVT rdsvt;
 								rdsvt.head[0] = (unsigned char)(29 & 0xFF);
 								rdsvt.head[1] = (unsigned char)(29 >> 8 & 0x1F);
@@ -1686,13 +1668,13 @@ void CQnetLink::Process()
 
 								memcpy(rdsvt.dsvt.title, dsvt.title, 27);
 
-								sendto(ref_g2_sock, rdsvt.head, 29, 0, (struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(struct sockaddr_in));
-							} else if (to_remote_g2[i].toDst4.sin_port == htons(rmt_dcs_port)) {
+								sendto(ref_g2_sock, rdsvt.head, 29, 0, to_remote_g2[i].addr.GetPointer(), sizeof(struct sockaddr_in));
+							} else if (rmt_dcs_port == to_remote_g2[i].addr.GetPort()) {
 								memset(dcs_buf, 0x00, 600);
 								dcs_buf[0] = dcs_buf[1] = dcs_buf[2] = '0';
 								dcs_buf[3] = '1';
 								dcs_buf[4] = dcs_buf[5] = dcs_buf[6] = 0x0;
-								memcpy(dcs_buf + 7, to_remote_g2[i].to_call, 8);
+								memcpy(dcs_buf + 7, to_remote_g2[i].cs, 8);
 								dcs_buf[14] = to_remote_g2[i].to_mod;
 								memcpy(dcs_buf + 15, owner.c_str(), CALL_SIZE);
 								dcs_buf[22] =  to_remote_g2[i].from_mod;
@@ -1712,7 +1694,7 @@ void CQnetLink::Process()
 								dcs_buf[61] = 0x01;
 								dcs_buf[62] = 0x00;
 
-								sendto(dcs_g2_sock, dcs_buf, 100, 0, (struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(to_remote_g2[i].toDst4));
+								sendto(dcs_g2_sock, dcs_buf, 100, 0, to_remote_g2[i].addr.GetPointer(), to_remote_g2[i].addr.GetSize());
 							}
 
 							if (dsvt.ctrl & 0x40) {
@@ -1723,18 +1705,16 @@ void CQnetLink::Process()
 					}
 				}
 			}
-			FD_CLR (xrf_g2_sock,&fdset);
+			FD_CLR (xrf_g2_sock, &fdset);
 		}
 
 		if (FD_ISSET(ref_g2_sock, &fdset)) {
-			socklen_t fromlen = sizeof(struct sockaddr_in);
+			socklen_t fromlen = sizeof(struct sockaddr_storage);
 			unsigned char buf[100];
-			int length = recvfrom(ref_g2_sock, buf, 100, 0, (struct sockaddr *)&fromDst4,&fromlen);
+			int length = recvfrom(ref_g2_sock, buf, 100, 0, fromDst4.GetPointer(), &fromlen);
 
-			strncpy(ip, inet_ntoa(fromDst4.sin_addr), IP_SIZE);
-			ip[IP_SIZE] = '\0';
-
-			found = false;
+			const std::string addr(fromDst4.GetAddress());
+			bool found = false;
 
 			/* LH */
 			if (length==4 && buf[0]==4 && buf[1]==192 && buf[2]==7 && buf[3]==0) {
@@ -1742,7 +1722,7 @@ void CQnetLink::Process()
 				unsigned short k_idx = 0;
 				unsigned char tmp[2];
 
-				auto pos = inbound_list.find(ip);
+				auto pos = inbound_list.find(addr);
 				if (pos != inbound_list.end()) {
 					//SINBOUND *inbound = (SINBOUND *)pos->second;
 					// printf("Remote station %s %s requested LH list\n", inbound_ptr->call, ip);
@@ -1824,7 +1804,7 @@ void CQnetLink::Process()
 				unsigned char tmp[2];
 				unsigned short total = 0;
 
-				auto pos = inbound_list.find(ip);
+				auto pos = inbound_list.find(addr);
 				if (pos != inbound_list.end()) {
 					//SINBOUND *inbound = (SINBOUND *)pos->second;
 					// printf("Remote station %s %s requested linked repeaters list\n", inbound_ptr->call, ip);
@@ -1851,7 +1831,7 @@ void CQnetLink::Process()
 							else if (i == 2)
 								buf[8 + (20 * j_idx)] = 'C';
 
-							strcpy((char *)buf + 9 + (20 * j_idx), to_remote_g2[i].to_call);
+							strcpy((char *)buf + 9 + (20 * j_idx), to_remote_g2[i].cs);
 							buf[16 + (20 * j_idx)] = to_remote_g2[i].to_mod;
 
 							buf[17 + (20 * j_idx)] = buf[18 + (20 * j_idx)] = buf[19 + (20 * j_idx)] = 0;
@@ -1908,7 +1888,7 @@ void CQnetLink::Process()
 				unsigned char tmp[2];
 				unsigned short total = 0;
 
-				auto pos = inbound_list.find(ip);
+				auto pos = inbound_list.find(addr);
 				if (pos != inbound_list.end()) {
 					// printf("Remote station %s %s requested connected user list\n", inbound_ptr->call, ip);
 					/* header is 8 bytes */
@@ -1984,7 +1964,7 @@ void CQnetLink::Process()
 				time_t ltime;
 				struct tm tm;
 
-				auto pos = inbound_list.find(ip);
+				auto pos = inbound_list.find(addr);
 				if (pos != inbound_list.end()) {
 					//SINBOUND *inbound = (SINBOUND *)pos->second;
 					// printf("Remote station %s %s requested date\n", inbound_ptr->call, ip);
@@ -1997,15 +1977,13 @@ void CQnetLink::Process()
 					buf[5] = 0xae;
 					buf[6] = 0x37;
 					buf[7] = 0x4d;
-					snprintf((char *)buf + 8, 99, "20%02d/%02d/%02d %02d:%02d:%02d %5.5s",
-							tm.tm_year % 100, tm.tm_mon+1,tm.tm_mday, tm.tm_hour,tm.tm_min,tm.tm_sec,
-							(tzname[0] == NULL)?"     ":tzname[0]);
+					snprintf((char *)buf + 8, 99, "20%02d/%02d/%02d %02d:%02d:%02d %5.5s", tm.tm_year % 100, tm.tm_mon+1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, (tzname[0] == NULL) ? "     " : tzname[0]);
 
 					sendto(ref_g2_sock, buf, 34, 0, (struct sockaddr *)&fromDst4, sizeof(struct sockaddr_in));
 				}
 			/* version request */
 			} else if (length== 4 && buf[0]==4 && buf[1]==192 && buf[2]==3 && buf[3]==0) {
-				auto pos = inbound_list.find(ip);
+				auto pos = inbound_list.find(addr);
 				if (pos != inbound_list.end()) {
 					//SINBOUND *inbound = (SINBOUND *)pos->second;
 					// printf("Remote station %s %s requested version\n", inbound_ptr->call, ip);
@@ -2021,11 +1999,11 @@ void CQnetLink::Process()
 				sendto(ref_g2_sock, buf, 5, 0, (struct sockaddr *)&fromDst4, sizeof(struct sockaddr_in));
 
 				for (int i=0; i<3; i++) {
-					if (fromDst4.sin_addr.s_addr==to_remote_g2[i].toDst4.sin_addr.s_addr && to_remote_g2[i].toDst4.sin_port==htons(rmt_ref_port)) {
-						printf("Call %s disconnected\n", to_remote_g2[i].to_call);
+					if ((0 == addr.compare(to_remote_g2[i].addr.GetAddress())) && (rmt_ref_port == to_remote_g2[i].addr.GetPort())) {
+						printf("Call %s disconnected\n", to_remote_g2[i].cs);
 
-						to_remote_g2[i].to_call[0] = '\0';
-						memset(&(to_remote_g2[i].toDst4),0,sizeof(struct sockaddr_in));
+						to_remote_g2[i].cs[0] = '\0';
+						to_remote_g2[i].addr.Clear();
 						to_remote_g2[i].from_mod = to_remote_g2[i].to_mod = ' ';
 						to_remote_g2[i].countdown = 0;
 						to_remote_g2[i].is_connected = false;
@@ -2033,7 +2011,7 @@ void CQnetLink::Process()
 					}
 				}
 
-				auto pos = inbound_list.find(ip);
+				auto pos = inbound_list.find(addr);
 				if (pos != inbound_list.end()) {
 					SINBOUND *inbound = (SINBOUND *)pos->second;
 					if (memcmp(inbound->call, "1NFO", 4) != 0)
@@ -2041,15 +2019,15 @@ void CQnetLink::Process()
 					free(pos->second);
 					pos->second = NULL;
 					inbound_list.erase(pos);
+					qnDB.DeleteLS(pos->first.c_str());
 				}
-				print_status_file();
 			}
 
 			for (int i=0; i<3; i++) {
-				if (fromDst4.sin_addr.s_addr==to_remote_g2[i].toDst4.sin_addr.s_addr && to_remote_g2[i].toDst4.sin_port==htons(rmt_ref_port)) {
+				if ((0 == addr.compare(to_remote_g2[i].addr.GetAddress())) && (rmt_ref_port == to_remote_g2[i].addr.GetPort())) {
 					found = true;
 					if (length==5 && buf[0]==5 && buf[1]==0 && buf[2]==24 && buf[3]==0 && buf[4]==1) {
-						printf("Connected to call %s\n", to_remote_g2[i].to_call);
+						printf("Connected to call %s\n", to_remote_g2[i].cs);
 						queryCommand[0] = 28;
 						queryCommand[1] = 192;
 						queryCommand[2] = 4;
@@ -2067,7 +2045,7 @@ void CQnetLink::Process()
 
 						// ATTENTION: I should ONLY send once for each distinct
 						// remote IP, so  get out of the loop immediately
-						sendto(ref_g2_sock, queryCommand, 28, 0, (struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(to_remote_g2[i].toDst4));
+						sendto(ref_g2_sock, queryCommand, 28, 0, to_remote_g2[i].addr.GetPointer(), to_remote_g2[i].addr.GetSize());
 
 						break;
 					}
@@ -2075,42 +2053,41 @@ void CQnetLink::Process()
 			}
 
 			for (int i=0; i<3; i++) {
-				if ((fromDst4.sin_addr.s_addr == to_remote_g2[i].toDst4.sin_addr.s_addr) && (to_remote_g2[i].toDst4.sin_port == htons(rmt_ref_port))) {
+				if ((0 == addr.compare(to_remote_g2[i].addr.GetAddress())) && (rmt_ref_port == to_remote_g2[i].addr.GetPort())) {
 					found = true;
 					if (length==8 && buf[0]==8 && buf[1]==192 && buf[2]==4 && buf[3]==0) {
 						if (buf[4]== 79 && buf[5]==75 && buf[6]==82) {
 							if (!to_remote_g2[i].is_connected) {
 								to_remote_g2[i].is_connected = true;
 								to_remote_g2[i].countdown = TIMEOUT;
-								printf("Login OK to call %s mod %c\n", to_remote_g2[i].to_call, to_remote_g2[i].to_mod);
-								print_status_file();
-
+								printf("Login OK to call %s mod %c\n", to_remote_g2[i].cs, to_remote_g2[i].to_mod);
 								tracing[i].last_time = time(NULL);
+								qnDB.UpdateLS(addr.c_str(), to_remote_g2[i].from_mod, to_remote_g2[i].cs, to_remote_g2[i].to_mod, tracing[i].last_time);
 
-								strcpy(linked_remote_system, to_remote_g2[i].to_call);
+								strcpy(linked_remote_system, to_remote_g2[i].cs);
 								space_p = strchr(linked_remote_system, ' ');
 								if (space_p)
 									*space_p = '\0';
 								sprintf(notify_msg[i], "%c_linked.dat_LINKED_%s_%c", to_remote_g2[i].from_mod, linked_remote_system, to_remote_g2[i].to_mod);
 							}
 						} else if (buf[4]==70 && buf[5]==65 && buf[6]==73 && buf[7]==76) {
-							printf("Login failed to call %s mod %c\n", to_remote_g2[i].to_call, to_remote_g2[i].to_mod);
+							printf("Login failed to call %s mod %c\n", to_remote_g2[i].cs, to_remote_g2[i].to_mod);
 
 							sprintf(notify_msg[i], "%c_failed_link.dat_FAILED_TO_LINK", to_remote_g2[i].from_mod);
 
-							to_remote_g2[i].to_call[0] = '\0';
-							memset(&(to_remote_g2[i].toDst4),0,sizeof(struct sockaddr_in));
+							to_remote_g2[i].cs[0] = '\0';
+							to_remote_g2[i].addr.Clear();
 							to_remote_g2[i].from_mod = to_remote_g2[i].to_mod = ' ';
 							to_remote_g2[i].countdown = 0;
 							to_remote_g2[i].is_connected = false;
 							to_remote_g2[i].in_streamid = 0x0;
 						} else if (buf[4]==66 && buf[5]==85 && buf[6]==83 && buf[7]==89) {
-							printf("Busy or unknown status from call %s mod %c\n", to_remote_g2[i].to_call, to_remote_g2[i].to_mod);
+							printf("Busy or unknown status from call %s mod %c\n", to_remote_g2[i].cs, to_remote_g2[i].to_mod);
 
 							sprintf(notify_msg[i], "%c_failed_link.dat_FAILED_TO_LINK", to_remote_g2[i].from_mod);
 
-							to_remote_g2[i].to_call[0] = '\0';
-							memset(&(to_remote_g2[i].toDst4),0,sizeof(struct sockaddr_in));
+							to_remote_g2[i].cs[0] = '\0';
+							to_remote_g2[i].addr.Clear();
 							to_remote_g2[i].from_mod = to_remote_g2[i].to_mod = ' ';
 							to_remote_g2[i].countdown = 0;
 							to_remote_g2[i].is_connected = false;
@@ -2121,7 +2098,7 @@ void CQnetLink::Process()
 			}
 
 			for (int i=0; i<3; i++) {
-				if ((fromDst4.sin_addr.s_addr == to_remote_g2[i].toDst4.sin_addr.s_addr) && (to_remote_g2[i].toDst4.sin_port == htons(rmt_ref_port))) {
+				if ((0 == addr.compare(to_remote_g2[i].addr.GetAddress())) && (rmt_ref_port == to_remote_g2[i].addr.GetPort())) {
 					found = true;
 					if (length==24 && buf[0]==24 && buf[1]==192 && buf[2]==3 && buf[3]==0) {
 						to_remote_g2[i].countdown = TIMEOUT;
@@ -2130,7 +2107,7 @@ void CQnetLink::Process()
 			}
 
 			for (int i=0; i<3; i++) {
-				if (fromDst4.sin_addr.s_addr==to_remote_g2[i].toDst4.sin_addr.s_addr && to_remote_g2[i].toDst4.sin_port==htons(rmt_ref_port)) {
+				if ((0 == addr.compare(to_remote_g2[i].addr.GetAddress())) && (rmt_ref_port == to_remote_g2[i].addr.GetPort())) {
 					found = true;
 					if (length == 3)
 						to_remote_g2[i].countdown = TIMEOUT;
@@ -2138,7 +2115,7 @@ void CQnetLink::Process()
 			}
 
 			/* find out if it is a connected dongle */
-			auto pos = inbound_list.find(ip);
+			auto pos = inbound_list.find(addr);
 			if (pos != inbound_list.end()) {
 				SINBOUND *inbound = (SINBOUND *)pos->second;
 				found = true;
@@ -2156,29 +2133,23 @@ void CQnetLink::Process()
 				*/
 				if (length==5 && buf[0]==5 && buf[1]==0 && buf[2]==24 && buf[3]==0 && buf[4]==1) {
 					if ((inbound_list.size() + 1) > max_dongles)
-						printf("Inbound DONGLE-p connection from %s but over the max_dongles limit of %d\n", ip, (int)inbound_list.size());
+						printf("Inbound DONGLE-p connection from %s but over the max_dongles limit of %d\n", addr.c_str(), (int)inbound_list.size());
 					else
 						sendto(ref_g2_sock, buf, 5, 0, (struct sockaddr *)&fromDst4, sizeof(fromDst4));
 				} else if (length==28 && buf[0]==28 && buf[1]==192 && buf[2]==4 && buf[3]==0) {
 					/* verify callsign */
-					memcpy(call, buf + 4, CALL_SIZE);
-					call[CALL_SIZE] = '\0';
-					for (int i=7; i>0; i--) {
-						if (call[i] == '\0')
-							call[i] = ' ';
-						else
-							break;
-					}
+					std::string call((const char *)buf+4, CALL_SIZE);
+					call.resize(CALL_SIZE, ' ');
 
-					if (memcmp(call, "1NFO", 4))
-						printf("Inbound DONGLE-p CALL=%s, ip=%s, DV=%.8s\n", call, ip, buf + 20);
+					if (0 == call.compare(0, 4, "1NFO"))
+						printf("Inbound DONGLE-p CALL=%s, ip=%s, DV=%.8s\n", call.c_str(), addr.c_str(), buf + 20);
 
 					if ((inbound_list.size() + 1) > max_dongles)
-						printf("Inbound DONGLE-p connection from %s but over the max_dongles limit of %d\n", ip, (int)inbound_list.size());
+						printf("Inbound DONGLE-p connection from %s but over the max_dongles limit of %d\n", addr.c_str(), (int)inbound_list.size());
 					//else if (admin.size() && (admin.find(call) == admin.end()))
 					//	printf("Incoming call [%s] from %s not an ADMIN\n", call, ip);
-					else if (regexec(&preg, call, 0, NULL, 0) != 0) {
-						printf("Invalid dongle callsign: CALL=%s,ip=%s\n", call, ip);
+					else if (regexec(&preg, call.c_str(), 0, NULL, 0) != 0) {
+						printf("Invalid dongle callsign: CALL=%s, ip=%s\n", call.c_str(), addr.c_str());
 
 						buf[0] = 8;
 						buf[4] = 70;
@@ -2189,11 +2160,11 @@ void CQnetLink::Process()
 						sendto(ref_g2_sock, buf, 8, 0, (struct sockaddr *)&fromDst4, sizeof(fromDst4));
 					} else {
 						/* add the dongle to the inbound list */
-						SINBOUND *inbound = (SINBOUND *)malloc(sizeof(SINBOUND));
+						SINBOUND *inbound = new SINBOUND;
 						if (inbound) {
 							inbound->countdown = TIMEOUT;
-							memcpy((char *)&(inbound->sin),(char *)&fromDst4, sizeof(struct sockaddr_in));
-							strcpy(inbound->call, call);
+							inbound->addr = fromDst4;
+							strcpy(inbound->call, call.c_str());
 
 							inbound->mod = ' ';
 
@@ -2204,10 +2175,10 @@ void CQnetLink::Process()
 							else
 								inbound->client = 'D';  /* dongle */
 
-							auto insert_pair = inbound_list.insert(std::pair<std::string, SINBOUND *>(ip, inbound));
+							auto insert_pair = inbound_list.insert(std::pair<std::string, SINBOUND *>(addr, inbound));
 							if (insert_pair.second) {
 								if (memcmp(inbound->call, "1NFO", 4) != 0)
-									printf("new CALL=%s, DONGLE-p, ip=%s, users=%d\n", inbound->call,ip, (int)inbound_list.size());
+									printf("new CALL=%s, DONGLE-p, ip=%s, users=%d\n", inbound->call, addr.c_str(), (int)inbound_list.size());
 
 								buf[0] = 8;
 								buf[4] = 79;
@@ -2216,10 +2187,10 @@ void CQnetLink::Process()
 								buf[7] = 87;
 
 								sendto(ref_g2_sock, buf, 8, 0, (struct sockaddr *)&fromDst4, sizeof(fromDst4));
-								print_status_file();
+								qnDB.UpdateLS(inbound->addr.GetAddress(), 'p', inbound->call, 'p', time(NULL));
 
 							} else {
-								printf("failed to add CALL=%s,ip=%s\n",inbound->call,ip);
+								printf("failed to add CALL=%s,ip=%s\n",inbound->call, addr.c_str());
 								free(inbound);
 								inbound = NULL;
 
@@ -2232,7 +2203,7 @@ void CQnetLink::Process()
 								sendto(ref_g2_sock, buf, 8, 0, (struct sockaddr *)&fromDst4, sizeof(fromDst4));
 							}
 						} else {
-							printf("malloc() failed for call=%s,ip=%s\n",call,ip);
+							fprintf(stderr, "newfailed for call=%s, ip=%s\n", call.c_str(), addr.c_str());
 
 							buf[0] = 8;
 							buf[4] = 70;
@@ -2250,13 +2221,13 @@ void CQnetLink::Process()
 				/* Is it one of the donglers or repeaters-reflectors */
 				found = false;
 				for (int i=0; i<3; i++) {
-					if (fromDst4.sin_addr.s_addr==to_remote_g2[i].toDst4.sin_addr.s_addr && to_remote_g2[i].toDst4.sin_port==htons(rmt_ref_port)) {
+					if ((0 == addr.compare(to_remote_g2[i].addr.GetAddress())) && (rmt_ref_port == to_remote_g2[i].addr.GetPort())) {
 						to_remote_g2[i].countdown = TIMEOUT;
 						found = true;
 					}
 				}
 				if (!found) {
-					auto pos = inbound_list.find(ip);
+					auto pos = inbound_list.find(addr);
 					if (pos != inbound_list.end()) {
 						SINBOUND *inbound = (SINBOUND *)pos->second;
 						inbound->countdown = TIMEOUT;
@@ -2281,16 +2252,16 @@ void CQnetLink::Process()
 					/* It is from a repeater-reflector, correct rpt1, rpt2 and re-compute pfcs */
 					int i;
 					for (i=0; i<3; i++) {
-						if (fromDst4.sin_addr.s_addr==to_remote_g2[i].toDst4.sin_addr.s_addr && to_remote_g2[i].toDst4.sin_port==htons(rmt_ref_port) &&
+						if ((0 == addr.compare(to_remote_g2[i].addr.GetAddress())) && (rmt_ref_port == to_remote_g2[i].addr.GetPort()) &&
 						        (
-						            (0==memcmp(rdsvt.dsvt.hdr.rpt1, to_remote_g2[i].to_call, 7) && rdsvt.dsvt.hdr.rpt1[7]==to_remote_g2[i].to_mod)  ||
-						            (0==memcmp(rdsvt.dsvt.hdr.rpt2, to_remote_g2[i].to_call, 7) && rdsvt.dsvt.hdr.rpt2[7]==to_remote_g2[i].to_mod)
+						            (0==memcmp(rdsvt.dsvt.hdr.rpt1, to_remote_g2[i].cs, 7) && rdsvt.dsvt.hdr.rpt1[7]==to_remote_g2[i].to_mod)  ||
+						            (0==memcmp(rdsvt.dsvt.hdr.rpt2, to_remote_g2[i].cs, 7) && rdsvt.dsvt.hdr.rpt2[7]==to_remote_g2[i].to_mod)
 						        )) {
 							memcpy(rdsvt.dsvt.hdr.rpt1, owner.c_str(), CALL_SIZE);
 							rdsvt.dsvt.hdr.rpt1[7] = to_remote_g2[i].from_mod;
 							memcpy(rdsvt.dsvt.hdr.urcall, "CQCQCQ  ", CALL_SIZE);
 
-							memcpy(source_stn, to_remote_g2[i].to_call, CALL_SIZE);
+							memcpy(source_stn, to_remote_g2[i].cs, CALL_SIZE);
 							source_stn[7] = to_remote_g2[i].to_mod;
 
 							break;
@@ -2298,7 +2269,7 @@ void CQnetLink::Process()
 					}
 
 					if (i == 3) {
-						pos = inbound_list.find(ip);
+						pos = inbound_list.find(addr);
 						if (pos != inbound_list.end()) {
 							SINBOUND *inbound = (SINBOUND *)pos->second;
 							memcpy(source_stn, inbound->call, 8);
@@ -2329,7 +2300,7 @@ void CQnetLink::Process()
 								printf("START from remote g2: streamID=%04x, flags=%02x:%02x:%02x, my=%.8s, sfx=%.4s, ur=%.8s, rpt1=%.8s, rpt2=%.8s, %d bytes fromIP=%s, source=%.8s\n",
 								        ntohs(rdsvt.dsvt.streamid), rdsvt.dsvt.hdr.flag[0], rdsvt.dsvt.hdr.flag[0], rdsvt.dsvt.hdr.flag[0],
 								        rdsvt.dsvt.hdr.mycall, rdsvt.dsvt.hdr.sfx, rdsvt.dsvt.hdr.urcall, rdsvt.dsvt.hdr.rpt1, rdsvt.dsvt.hdr.rpt2,
-								        length, inet_ntoa(fromDst4.sin_addr), source_stn);
+								        length, fromDst4.GetAddress(), source_stn);
 
 							// put user into tmp1
 							memcpy(tmp1, rdsvt.dsvt.hdr.mycall, 8);
@@ -2356,18 +2327,18 @@ void CQnetLink::Process()
 						}
 
 						/* send the data to the local gateway/repeater */
-						sendto(rptr_sock, rdsvt.dsvt.title, 56, 0, (struct sockaddr *)&toLocalg2, sizeof(struct sockaddr_in));
+						sendto(rptr_sock, rdsvt.dsvt.title, 56, 0, toLocalg2.GetPointer(), toLocalg2.GetSize());
 
 						/* send the data to the donglers */
 						for (auto pos = inbound_list.begin(); pos != inbound_list.end(); pos++) {
 							SINBOUND *inbound = (SINBOUND *)pos->second;
-							if (fromDst4.sin_addr.s_addr != inbound->sin.sin_addr.s_addr) {
-								sendto(ref_g2_sock, rdsvt.head, 58, 0, (struct sockaddr *)&(inbound->sin), sizeof(struct sockaddr_in));
+							if (addr.compare(inbound->addr.GetAddress())) {
+								sendto(ref_g2_sock, rdsvt.head, 58, 0, inbound->addr.GetPointer(), sizeof(struct sockaddr_in));
 							} else
 								inbound->mod = rdsvt.dsvt.hdr.rpt1[7];
 						}
 
-						if (to_remote_g2[i].toDst4.sin_addr.s_addr!=fromDst4.sin_addr.s_addr && to_remote_g2[i].is_connected) {
+						if (addr.compare(to_remote_g2[i].addr.GetAddress()) && to_remote_g2[i].is_connected) {
 							if ( /*** (memcmp(readBuffer2 + 44, owner, 8) != 0) && ***/         /* block repeater announcements */
 							    0==memcmp(rdsvt.dsvt.hdr.urcall, "CQCQCQ", 6) &&	/* CQ calls only */
 							    (rdsvt.dsvt.hdr.flag[0]==0x00 ||	/* normal */
@@ -2378,20 +2349,21 @@ void CQnetLink::Process()
 							    rdsvt.dsvt.hdr.rpt2[7] == 'G') {
 								to_remote_g2[i].in_streamid = rdsvt.dsvt.streamid;
 
-								if (to_remote_g2[i].toDst4.sin_port==htons(rmt_xrf_port) || to_remote_g2[i].toDst4.sin_port== htons(rmt_ref_port)) {
-									memcpy(rdsvt.dsvt.hdr.rpt1, to_remote_g2[i].to_call, CALL_SIZE);
+								const bool isxrf = (rmt_xrf_port == to_remote_g2[i].addr.GetPort());
+								if (isxrf || rmt_ref_port == to_remote_g2[i].addr.GetPort()) {
+									memcpy(rdsvt.dsvt.hdr.rpt1, to_remote_g2[i].cs, CALL_SIZE);
 									rdsvt.dsvt.hdr.rpt1[7] = to_remote_g2[i].to_mod;
-									memcpy(rdsvt.dsvt.hdr.rpt2, to_remote_g2[i].to_call, CALL_SIZE);
+									memcpy(rdsvt.dsvt.hdr.rpt2, to_remote_g2[i].cs, CALL_SIZE);
 									rdsvt.dsvt.hdr.rpt2[7] = 'G';
 									calcPFCS(rdsvt.dsvt.title, 56);
 
-									if (to_remote_g2[i].toDst4.sin_port == htons(rmt_xrf_port)) {
+									if (isxrf) {
 										/* inform XRF about the source */
 										rdsvt.dsvt.flagb[2] = to_remote_g2[i].from_mod;
-										sendto(xrf_g2_sock, rdsvt.dsvt.title, 56, 0, (struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(struct sockaddr_in));
+										sendto(xrf_g2_sock, rdsvt.dsvt.title, 56, 0, to_remote_g2[i].addr.GetPointer(), sizeof(struct sockaddr_in));
 									} else
-										sendto(ref_g2_sock, rdsvt.head, 58, 0, (struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(struct sockaddr_in));
-								} else if (to_remote_g2[i].toDst4.sin_port == htons(rmt_dcs_port)) {
+										sendto(ref_g2_sock, rdsvt.head, 58, 0, to_remote_g2[i].addr.GetPointer(), sizeof(struct sockaddr_in));
+								} else if (rmt_dcs_port == to_remote_g2[i].addr.GetPort()) {
 									memcpy(ref_2_dcs[i].mycall, rdsvt.dsvt.hdr.mycall, 8);
 									memcpy(ref_2_dcs[i].sfx, rdsvt.dsvt.hdr.sfx, 4);
 									ref_2_dcs[i].dcs_rptr_seq = 0;
@@ -2404,7 +2376,7 @@ void CQnetLink::Process()
 						for (int i=0; i<3; i++) {
 							if (old_sid[i].sid == rdsvt.dsvt.streamid) {
 								if (qso_details)
-									printf("END from remote g2: streamID=%04x, %d bytes from IP=%s\n", ntohs(rdsvt.dsvt.streamid), length, inet_ntoa(fromDst4.sin_addr));
+									printf("END from remote g2: streamID=%04x, %d bytes from IP=%s\n", ntohs(rdsvt.dsvt.streamid), length, fromDst4.GetAddress());
 
 								old_sid[i].sid = 0x0;
 
@@ -2414,30 +2386,30 @@ void CQnetLink::Process()
 					}
 
 					/* send the data to the local gateway/repeater */
-					sendto(rptr_sock, rdsvt.dsvt.title, 27, 0, (struct sockaddr *)&toLocalg2, sizeof(struct sockaddr_in));
+					sendto(rptr_sock, rdsvt.dsvt.title, 27, 0, toLocalg2.GetPointer(), toLocalg2.GetSize());
 
 					/* send the data to the donglers */
 					for (pos = inbound_list.begin(); pos != inbound_list.end(); pos++) {
 						SINBOUND *inbound = (SINBOUND *)pos->second;
-						if (fromDst4.sin_addr.s_addr != inbound->sin.sin_addr.s_addr) {
-							sendto(ref_g2_sock, rdsvt.head, 29, 0, (struct sockaddr *)&(inbound->sin), sizeof(struct sockaddr_in));
+						if (addr.compare(inbound->addr.GetAddress())) {
+							sendto(ref_g2_sock, rdsvt.head, 29, 0, inbound->addr.GetPointer(), sizeof(struct sockaddr_in));
 						}
 					}
 
 					for (int i=0; i<3; i++) {
-						if (to_remote_g2[i].is_connected && to_remote_g2[i].toDst4.sin_addr.s_addr!=fromDst4.sin_addr.s_addr && to_remote_g2[i].in_streamid==rdsvt.dsvt.streamid) {
-							if (to_remote_g2[i].toDst4.sin_port == htons(rmt_xrf_port)) {
+						if (to_remote_g2[i].is_connected && addr.compare(to_remote_g2[i].addr.GetAddress()) && to_remote_g2[i].in_streamid==rdsvt.dsvt.streamid) {
+							if (rmt_xrf_port == to_remote_g2[i].addr.GetPort()) {
 								/* inform XRF about the source */
 								rdsvt.dsvt.flagb[2] = to_remote_g2[i].from_mod;
-								sendto(xrf_g2_sock, rdsvt.dsvt.title, 27, 0, (struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(struct sockaddr_in));
-							} else if (to_remote_g2[i].toDst4.sin_port == htons(rmt_ref_port))
-								sendto(ref_g2_sock, rdsvt.head, 29,  0,(struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(struct sockaddr_in));
-							else if (to_remote_g2[i].toDst4.sin_port == htons(rmt_dcs_port)) {
+								sendto(xrf_g2_sock, rdsvt.dsvt.title, 27, 0, to_remote_g2[i].addr.GetPointer(), sizeof(struct sockaddr_in));
+							} else if (rmt_ref_port == to_remote_g2[i].addr.GetPort())
+								sendto(ref_g2_sock, rdsvt.head, 29,  0,to_remote_g2[i].addr.GetPointer(), sizeof(struct sockaddr_in));
+							else if (rmt_dcs_port == to_remote_g2[i].addr.GetPort()) {
 								memset(dcs_buf, 0x00, 600);
 								dcs_buf[0] = dcs_buf[1] = dcs_buf[2] = '0';
 								dcs_buf[3] = '1';
 								dcs_buf[4] = dcs_buf[5] = dcs_buf[6] = 0x0;
-								memcpy(dcs_buf + 7, to_remote_g2[i].to_call, 8);
+								memcpy(dcs_buf + 7, to_remote_g2[i].cs, 8);
 								dcs_buf[14] = to_remote_g2[i].to_mod;
 								memcpy(dcs_buf + 15, owner.c_str(), CALL_SIZE);
 								dcs_buf[22] = to_remote_g2[i].from_mod;
@@ -2458,7 +2430,7 @@ void CQnetLink::Process()
 								dcs_buf[61] = 0x01;
 								dcs_buf[62] = 0x00;
 
-								sendto(dcs_g2_sock, dcs_buf, 100, 0, (struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(to_remote_g2[i].toDst4));
+								sendto(dcs_g2_sock, dcs_buf, 100, 0, to_remote_g2[i].addr.GetPointer(), to_remote_g2[i].addr.GetSize());
 							}
 
 							if (rdsvt.dsvt.ctrl & 0x40) {
@@ -2469,15 +2441,14 @@ void CQnetLink::Process()
 					}
 				}
 			}
-			FD_CLR (ref_g2_sock,&fdset);
+			FD_CLR (ref_g2_sock, &fdset);
 		}
 
 		if (FD_ISSET(dcs_g2_sock, &fdset)) {
-			socklen_t fromlen = sizeof(struct sockaddr_in);
-			int length = recvfrom(dcs_g2_sock, dcs_buf, 1000, 0, (struct sockaddr *)&fromDst4, &fromlen);
+			socklen_t fromlen = sizeof(struct sockaddr_storage);
+			int length = recvfrom(dcs_g2_sock, dcs_buf, 1000, 0, fromDst4.GetPointer(), &fromlen);
 
-			strncpy(ip, inet_ntoa(fromDst4.sin_addr), IP_SIZE);
-			ip[IP_SIZE] = '\0';
+			const std::string addr(fromDst4.GetAddress());
 
 			/* header, audio */
 			if (dcs_buf[0]=='0' && dcs_buf[1]=='0' && dcs_buf[2]=='0' && dcs_buf[3]=='1') {
@@ -2488,9 +2459,9 @@ void CQnetLink::Process()
 					/* find out our local module */
 					int i;
 					for (i=0; i<3; i++) {
-						if (to_remote_g2[i].is_connected && fromDst4.sin_addr.s_addr==to_remote_g2[i].toDst4.sin_addr.s_addr &&
-								0==memcmp(dcs_buf + 7, to_remote_g2[i].to_call, 7) && to_remote_g2[i].to_mod==dcs_buf[14]) {
-							memcpy(source_stn, to_remote_g2[i].to_call, 8);
+						if (to_remote_g2[i].is_connected && (0 == addr.compare(to_remote_g2[i].addr.GetAddress())) &&
+								0==memcmp(dcs_buf + 7, to_remote_g2[i].cs, 7) && to_remote_g2[i].to_mod==dcs_buf[14]) {
+							memcpy(source_stn, to_remote_g2[i].cs, 8);
 							source_stn[7] = to_remote_g2[i].to_mod;
 							break;
 						}
@@ -2503,7 +2474,7 @@ void CQnetLink::Process()
 							if (qso_details)
 								printf("START from dcs: streamID=%02x%02x, my=%.8s, sfx=%.4s, ur=%.8s, rpt1=%.8s, rpt2=%.8s, %d bytes fromIP=%s, source=%.8s\n",
 								        dcs_buf[44],dcs_buf[43], &dcs_buf[31], &dcs_buf[39], &dcs_buf[23], &dcs_buf[7], &dcs_buf[15],
-								        length, inet_ntoa(fromDst4.sin_addr), source_stn);
+								        length, fromDst4.GetAddress(), source_stn);
 
 							// put user into tmp1
 							memcpy(tmp1, dcs_buf + 31, 8);
@@ -2567,13 +2538,13 @@ void CQnetLink::Process()
 
 							/* send the header to the local gateway/repeater */
 							for (int j=0; j<5; j++)
-								sendto(rptr_sock, rdsvt.dsvt.title, 56, 0, (struct sockaddr *)&toLocalg2,sizeof(struct sockaddr_in));
+								sendto(rptr_sock, rdsvt.dsvt.title, 56, 0, toLocalg2.GetPointer(), toLocalg2.GetSize());
 
 							/* send the data to the donglers */
 							for (auto pos = inbound_list.begin(); pos != inbound_list.end(); pos++) {
 								SINBOUND *inbound = (SINBOUND *)pos->second;
 								for (int j=0; j<5; j++)
-									sendto(ref_g2_sock, rdsvt.head, 58, 0, (struct sockaddr *)&(inbound->sin), sizeof(struct sockaddr_in));
+									sendto(ref_g2_sock, rdsvt.head, 58, 0, inbound->addr.GetPointer(), sizeof(struct sockaddr_in));
 							}
 						}
 
@@ -2600,19 +2571,19 @@ void CQnetLink::Process()
 							memcpy(rdsvt.dsvt.vasd.voice, dcs_buf+46, 12);
 
 							/* send the data to the local gateway/repeater */
-							sendto(rptr_sock, rdsvt.dsvt.title, 27, 0, (struct sockaddr *)&toLocalg2,sizeof(struct sockaddr_in));
+							sendto(rptr_sock, rdsvt.dsvt.title, 27, 0, toLocalg2.GetPointer(), toLocalg2.GetSize());
 
 							/* send the data to the donglers */
 							for (auto pos = inbound_list.begin(); pos != inbound_list.end(); pos++) {
 								SINBOUND *inbound = (SINBOUND *)pos->second;
-								sendto(ref_g2_sock, rdsvt.head, 29, 0, (struct sockaddr *)&(inbound->sin), sizeof(struct sockaddr_in));
+								sendto(ref_g2_sock, rdsvt.head, 29, 0, inbound->addr.GetPointer(), sizeof(struct sockaddr_in));
 							}
 
 							if ((dcs_buf[45] & 0x40) != 0) {
 								old_sid[i].sid = 0x0;
 
 								if (qso_details)
-									printf("END from dcs: streamID=%04x, %d bytes from IP=%s\n", ntohs(rdsvt.dsvt.streamid), length, inet_ntoa(fromDst4.sin_addr));
+									printf("END from dcs: streamID=%04x, %d bytes from IP=%s\n", ntohs(rdsvt.dsvt.streamid), length, fromDst4.GetAddress());
 
 								to_remote_g2[i].in_streamid = 0x0;
 								dcs_seq[i] = 0xff;
@@ -2638,16 +2609,16 @@ void CQnetLink::Process()
 				// DG1HT from owner 8 to 7
 				if (i>=0 && 0==memcmp(dcs_buf + 9, owner.c_str(), CALL_SIZE-1)) {
 					/* is that the remote system that we asked to connect to? */
-					if (fromDst4.sin_addr.s_addr==to_remote_g2[i].toDst4.sin_addr.s_addr && to_remote_g2[i].toDst4.sin_port==htons(rmt_dcs_port) &&
-							0==memcmp(to_remote_g2[i].to_call, dcs_buf, 7) && to_remote_g2[i].to_mod==dcs_buf[7]) {
+					if ((0 == addr.compare(to_remote_g2[i].addr.GetAddress())) && (rmt_dcs_port == to_remote_g2[i].addr.GetPort()) &&
+							0==memcmp(to_remote_g2[i].cs, dcs_buf, 7) && to_remote_g2[i].to_mod==dcs_buf[7]) {
 						if (!to_remote_g2[i].is_connected) {
 							tracing[i].last_time = time(NULL);
 
 							to_remote_g2[i].is_connected = true;
 							printf("Connected from: %.*s\n", 8, dcs_buf);
-							print_status_file();
+							qnDB.UpdateLS(addr.c_str(), to_remote_g2[i].from_mod, to_remote_g2[i].cs, to_remote_g2[i].to_mod, tracing[i].last_time);
 
-							strcpy(linked_remote_system, to_remote_g2[i].to_call);
+							strcpy(linked_remote_system, to_remote_g2[i].cs);
 							space_p = strchr(linked_remote_system, ' ');
 							if (space_p)
 								*space_p = '\0';
@@ -2668,35 +2639,33 @@ void CQnetLink::Process()
 				/* It is one of our valid repeaters */
 				if ((i >= 0) && (memcmp(dcs_buf, owner.c_str(), CALL_SIZE) == 0)) {
 					/* It is from a remote that we contacted */
-					if ((fromDst4.sin_addr.s_addr == to_remote_g2[i].toDst4.sin_addr.s_addr) && (to_remote_g2[i].toDst4.sin_port == htons(rmt_dcs_port)) && (to_remote_g2[i].from_mod == dcs_buf[8])) {
+					if ((0 == addr.compare(to_remote_g2[i].addr.GetAddress())) && (rmt_dcs_port == to_remote_g2[i].addr.GetPort()) && (to_remote_g2[i].from_mod == dcs_buf[8])) {
 						if ((to_remote_g2[i].to_mod == dcs_buf[9]) && (memcmp(dcs_buf + 10, "ACK", 3) == 0)) {
 							to_remote_g2[i].countdown = TIMEOUT;
 							if (!to_remote_g2[i].is_connected) {
 								tracing[i].last_time = time(NULL);
 
 								to_remote_g2[i].is_connected = true;
-								printf("Connected from: %.*s\n", 8, to_remote_g2[i].to_call);
-								print_status_file();
+								printf("Connected from: %.*s\n", 8, to_remote_g2[i].cs);
+								qnDB.UpdateLS(addr.c_str(), to_remote_g2[i].from_mod, to_remote_g2[i].cs, to_remote_g2[i].to_mod, tracing[i].last_time);
 
-								strcpy(linked_remote_system, to_remote_g2[i].to_call);
+								strcpy(linked_remote_system, to_remote_g2[i].cs);
 								space_p = strchr(linked_remote_system, ' ');
 								if (space_p)
 									*space_p = '\0';
 								sprintf(notify_msg[i], "%c_linked.dat_LINKED_%s_%c", to_remote_g2[i].from_mod, linked_remote_system, to_remote_g2[i].to_mod);
 							}
 						} else if (memcmp(dcs_buf + 10, "NAK", 3) == 0) {
-							printf("Link module %c to [%s] %c is unlinked\n", to_remote_g2[i].from_mod, to_remote_g2[i].to_call, to_remote_g2[i].to_mod);
+							printf("Link module %c to [%s] %c is unlinked\n", to_remote_g2[i].from_mod, to_remote_g2[i].cs, to_remote_g2[i].to_mod);
 
 							sprintf(notify_msg[i], "%c_failed_link.dat_UNLINKED", to_remote_g2[i].from_mod);
-
-							to_remote_g2[i].to_call[0] = '\0';
-							memset(&(to_remote_g2[i].toDst4),0,sizeof(struct sockaddr_in));
+							qnDB.DeleteLS(to_remote_g2[i].addr.GetAddress());
+							to_remote_g2[i].cs[0] = '\0';
+							to_remote_g2[i].addr.Clear();
 							to_remote_g2[i].from_mod = to_remote_g2[i].to_mod = ' ';
 							to_remote_g2[i].countdown = 0;
 							to_remote_g2[i].is_connected = false;
 							to_remote_g2[i].in_streamid = 0x0;
-
-							print_status_file();
 						}
 					}
 				}
@@ -2707,7 +2676,7 @@ void CQnetLink::Process()
 		if (FD_ISSET(rptr_sock, &fdset)) {
 			socklen_t fromlen = sizeof(struct sockaddr_in);
 			SDSTR dstr;
-			int length = recvfrom(rptr_sock, dstr.pkt_id, 100, 0, (struct sockaddr *)&fromRptr,&fromlen);
+			int length = recvfrom(rptr_sock, dstr.pkt_id, 100, 0, (struct sockaddr *)&fromRptr, &fromlen);
 
 			if ((length==58 || length==29 || length==32) && dstr.flag[0]==0x73 && dstr.flag[1] == 0x12 && dstr.flag[2] ==0x0 && (0==memcmp(dstr.pkt_id,"DSTR", 4) || 0==memcmp(dstr.pkt_id,"CCS_", 4)) && dstr.vpkt.icm_id==0x20 && (dstr.remaining==0x30 || dstr.remaining==0x13 || dstr.remaining==0x16)) {
 
@@ -2716,8 +2685,7 @@ void CQnetLink::Process()
 						printf("START from local g2: cntr=%04x, streamID=%04x, flags=%02x:%02x:%02x, my=%.8s, sfx=%.4s, ur=%.8s, rpt1=%.8s, rpt2=%.8s, %d bytes fromIP=%s\n", ntohs(dstr.counter), ntohs(dstr.vpkt.streamid), dstr.vpkt.hdr.flag[0], dstr.vpkt.hdr.flag[1], dstr.vpkt.hdr.flag[2], dstr.vpkt.hdr.my, dstr.vpkt.hdr.nm, dstr.vpkt.hdr.ur, dstr.vpkt.hdr.r1, dstr.vpkt.hdr.r2, length, inet_ntoa(fromRptr.sin_addr));
 
 					/* save mycall */
-					memcpy(call, dstr.vpkt.hdr.my, 8);
-					call[8] = '\0';
+					const std::string call((const char *)dstr.vpkt.hdr.my, 8);
 
 					int i = -1;
 					if (dstr.vpkt.hdr.r1[7] == 'A')
@@ -2773,20 +2741,20 @@ void CQnetLink::Process()
 									// or if there is an allow list, is he not in it?
 									(link_unlink_user.size() && link_unlink_user.find(call)==link_unlink_user.end())
 								) {
-								printf("link request denied, unauthorized user [%s]\n", call);
+								printf("link request denied, unauthorized user [%s]\n", call.c_str());
 							} else {
 								char temp_repeater[CALL_SIZE + 1];
 								memset(temp_repeater, ' ', CALL_SIZE);
 								memcpy(temp_repeater, dstr.vpkt.hdr.ur, CALL_SIZE - 2);
 								temp_repeater[CALL_SIZE] = '\0';
 
-								if ((to_remote_g2[i].to_call[0] == '\0') ||   /* not linked */
-								        ((to_remote_g2[i].to_call[0] != '\0') &&  /* waiting for a link reply that may never arrive */
+								if ((to_remote_g2[i].cs[0] == '\0') ||   /* not linked */
+								        ((to_remote_g2[i].cs[0] != '\0') &&  /* waiting for a link reply that may never arrive */
 								         !to_remote_g2[i].is_connected))
 
 									g2link(dstr.vpkt.hdr.r1[7], temp_repeater, dstr.vpkt.hdr.ur[6]);
 								else if (to_remote_g2[i].is_connected) {
-									strcpy(linked_remote_system, to_remote_g2[i].to_call);
+									strcpy(linked_remote_system, to_remote_g2[i].cs);
 									space_p = strchr(linked_remote_system, ' ');
 									if (space_p)
 										*space_p = '\0';
@@ -2800,16 +2768,17 @@ void CQnetLink::Process()
 									// or if there is an allow list, is he not in it?
 									(link_unlink_user.size() && link_unlink_user.find(call)==link_unlink_user.end())
 								) {
-								printf("unlink request denied, unauthorized user [%s]\n", call);
+								printf("unlink request denied, unauthorized user [%s]\n", call.c_str());
 							} else {
-								if (to_remote_g2[i].to_call[0] != '\0') {
-									if (to_remote_g2[i].toDst4.sin_port == htons(rmt_ref_port)) {
+								if (to_remote_g2[i].cs[0] != '\0') {
+									if (rmt_ref_port == to_remote_g2[i].addr.GetPort()) {
 										/* Check to see if any other local bands are linked to that same IP */
 										int j;
 										for (j=0; j<3; j++) {
 											if (j != i) {
-												if (to_remote_g2[j].toDst4.sin_addr.s_addr==to_remote_g2[i].toDst4.sin_addr.s_addr && to_remote_g2[j].toDst4.sin_port==htons(rmt_ref_port)) {
-													printf("Info: Local %c is also linked to %s (different module) %c\n", to_remote_g2[j].from_mod, to_remote_g2[j].to_call, to_remote_g2[j].to_mod);
+												const std::string a(to_remote_g2[i].addr.GetAddress());
+												if ((0 == a.compare(to_remote_g2[j].addr.GetAddress())) && (rmt_ref_port == to_remote_g2[j].addr.GetPort())) {
+													printf("Info: Local %c is also linked to %s (different module) %c\n", to_remote_g2[j].from_mod, to_remote_g2[j].cs, to_remote_g2[j].to_mod);
 													break;
 												}
 											}
@@ -2822,39 +2791,37 @@ void CQnetLink::Process()
 											queryCommand[2] = 24;
 											queryCommand[3] = 0;
 											queryCommand[4] = 0;
-											sendto(ref_g2_sock, queryCommand, 5, 0, (struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(to_remote_g2[i].toDst4));
+											sendto(ref_g2_sock, queryCommand, 5, 0, to_remote_g2[i].addr.GetPointer(), to_remote_g2[i].addr.GetSize());
 										}
-									} else if (to_remote_g2[i].toDst4.sin_port == htons(rmt_xrf_port)) {
+									} else if (rmt_xrf_port == to_remote_g2[i].addr.GetPort()) {
 										strcpy(unlink_request, owner.c_str());
 										unlink_request[8] = to_remote_g2[i].from_mod;
 										unlink_request[9] = ' ';
 										unlink_request[10] = '\0';
 
 										for (int j=0; j<5; j++)
-											sendto(xrf_g2_sock, unlink_request, CALL_SIZE+3, 0, (struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(to_remote_g2[i].toDst4));
+											sendto(xrf_g2_sock, unlink_request, CALL_SIZE+3, 0, to_remote_g2[i].addr.GetPointer(), to_remote_g2[i].addr.GetSize());
 									} else {
 										strcpy(cmd_2_dcs, owner.c_str());
 										cmd_2_dcs[8] = to_remote_g2[i].from_mod;
 										cmd_2_dcs[9] = ' ';
 										cmd_2_dcs[10] = '\0';
-										memcpy(cmd_2_dcs + 11, to_remote_g2[i].to_call, 8);
+										memcpy(cmd_2_dcs + 11, to_remote_g2[i].cs, 8);
 
 										for (int j=0; j<5; j++)
-											sendto(dcs_g2_sock, cmd_2_dcs, 19, 0, (struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(to_remote_g2[i].toDst4));
+											sendto(dcs_g2_sock, cmd_2_dcs, 19, 0, to_remote_g2[i].addr.GetPointer(), to_remote_g2[i].addr.GetSize());
 									}
 
-									printf("Unlinked from [%s] mod %c\n", to_remote_g2[i].to_call, to_remote_g2[i].to_mod);
+									printf("Unlinked from [%s] mod %c\n", to_remote_g2[i].cs, to_remote_g2[i].to_mod);
 									sprintf(notify_msg[i], "%c_unlinked.dat_UNLINKED", to_remote_g2[i].from_mod);
-
+									qnDB.DeleteLS(to_remote_g2[i].addr.GetAddress());
 									/* now zero out this entry */
-									to_remote_g2[i].to_call[0] = '\0';
-									memset(&(to_remote_g2[i].toDst4),0,sizeof(struct sockaddr_in));
+									to_remote_g2[i].cs[0] = '\0';
+									to_remote_g2[i].addr.Clear();
 									to_remote_g2[i].from_mod = to_remote_g2[i].to_mod = ' ';
 									to_remote_g2[i].countdown = 0;
 									to_remote_g2[i].is_connected = false;
 									to_remote_g2[i].in_streamid = 0x0;
-
-									print_status_file();
 								} else {
 									sprintf(notify_msg[i], "%c_already_unlinked.dat_UNLINKED", dstr.vpkt.hdr.r1[7]);
 								}
@@ -2862,7 +2829,7 @@ void CQnetLink::Process()
 						}
 						else if (0 == memcmp(dstr.vpkt.hdr.ur, "       I", CALL_SIZE)) {
 							if (to_remote_g2[i].is_connected) {
-								strcpy(linked_remote_system, to_remote_g2[i].to_call);
+								strcpy(linked_remote_system, to_remote_g2[i].cs);
 								space_p = strchr(linked_remote_system, ' ');
 								if (space_p)
 									*space_p = '\0';
@@ -2874,7 +2841,7 @@ void CQnetLink::Process()
 						else if (0==memcmp(dstr.vpkt.hdr.ur, "      ", 6) && dstr.vpkt.hdr.ur[7]=='X' && admin.find(call)!=admin.end()) { // only ADMIN can execute scripts
 							if (dstr.vpkt.hdr.ur[6] != ' ') {
 								memset(system_cmd, '\0', sizeof(system_cmd));
-								snprintf(system_cmd, FILENAME_MAX, "%s/exec_%c.sh %s %c &", announce_dir.c_str(), dstr.vpkt.hdr.ur[6], call, dstr.vpkt.hdr.r1[7]);
+								snprintf(system_cmd, FILENAME_MAX, "%s/exec_%c.sh %s %c &", announce_dir.c_str(), dstr.vpkt.hdr.ur[6], call.c_str(), dstr.vpkt.hdr.r1[7]);
 								printf("Executing %s\n", system_cmd);
 								system(system_cmd);
 							}
@@ -2920,19 +2887,19 @@ void CQnetLink::Process()
 						for (auto pos = inbound_list.begin(); pos != inbound_list.end(); pos++) {
 							SINBOUND *inbound = (SINBOUND *)pos->second;
 							for (int j=0; j<5; j++)
-								sendto(ref_g2_sock, rdsvt.head, 58, 0, (struct sockaddr *)&(inbound->sin), sizeof(struct sockaddr_in));
+								sendto(ref_g2_sock, rdsvt.head, 58, 0, inbound->addr.GetPointer(), sizeof(struct sockaddr_in));
 						}
 					}
 
 					if (i >= 0) {
 						/* do we have to broadcast ? */
 						/* make sure the source is linked to xrf */
-						if (to_remote_g2[i].is_connected && 0==memcmp(to_remote_g2[i].to_call, "XRF", 3) && 0==memcmp(dstr.vpkt.hdr.r2, owner.c_str(), CALL_SIZE-1) && dstr.vpkt.hdr.r2[7]=='G' && 0==memcmp(dstr.vpkt.hdr.ur, "CQCQCQ", 6)) {
+						if (to_remote_g2[i].is_connected && 0==memcmp(to_remote_g2[i].cs, "XRF", 3) && 0==memcmp(dstr.vpkt.hdr.r2, owner.c_str(), CALL_SIZE-1) && dstr.vpkt.hdr.r2[7]=='G' && 0==memcmp(dstr.vpkt.hdr.ur, "CQCQCQ", 6)) {
 							brd_from_rptr_idx = 0;
 							streamid_raw = ntohs(dstr.vpkt.streamid);
 
 							for (int j=0; j<3; j++) {
-								if (j!=i && to_remote_g2[j].is_connected && 0==memcmp(to_remote_g2[j].to_call, to_remote_g2[i].to_call, 8) && to_remote_g2[j].to_mod==to_remote_g2[i].to_mod && to_remote_g2[j].to_mod!='E') {
+								if (j!=i && to_remote_g2[j].is_connected && 0==memcmp(to_remote_g2[j].cs, to_remote_g2[i].cs, 8) && to_remote_g2[j].to_mod==to_remote_g2[i].to_mod && to_remote_g2[j].to_mod!='E') {
 									memcpy(fromrptr_torptr_brd.title, "DSVT", 4);
 									fromrptr_torptr_brd.config = 0x10;
 									fromrptr_torptr_brd.flaga[0] = fromrptr_torptr_brd.flaga[1] = fromrptr_torptr_brd.flaga[2] = 0x0;
@@ -2955,7 +2922,7 @@ void CQnetLink::Process()
 
 									calcPFCS(fromrptr_torptr_brd.title, 56);
 
-									sendto(xrf_g2_sock, fromrptr_torptr_brd.title, 56, 0, (struct sockaddr *)&toLocalg2, sizeof(struct sockaddr_in));
+									sendto(xrf_g2_sock, fromrptr_torptr_brd.title, 56, 0, toLocalg2.GetPointer(), toLocalg2.GetSize());
 
 									brd_from_rptr.from_rptr_streamid = dstr.vpkt.streamid;
 									brd_from_rptr.to_rptr_streamid[brd_from_rptr_idx] = fromrptr_torptr_brd.streamid;
@@ -2968,7 +2935,8 @@ void CQnetLink::Process()
 							if (0==memcmp(dstr.vpkt.hdr.r2, owner.c_str(), 7) && 0==memcmp(dstr.vpkt.hdr.ur, "CQCQCQ", 6) && dstr.vpkt.hdr.r2[7] == 'G') {
 								to_remote_g2[i].out_streamid = dstr.vpkt.streamid;
 
-								if (to_remote_g2[i].toDst4.sin_port==htons(rmt_xrf_port) || to_remote_g2[i].toDst4.sin_port== htons(rmt_ref_port)) {
+								const bool isxrf = (rmt_xrf_port == to_remote_g2[i].addr.GetPort());
+								if (isxrf || (rmt_ref_port == to_remote_g2[i].addr.GetPort())) {
 									SREFDSVT rdsvt;
 									rdsvt.head[0] = (unsigned char)(58 & 0xFF);
 									rdsvt.head[1] = (unsigned char)(58 >> 8 & 0x1F);
@@ -2983,25 +2951,25 @@ void CQnetLink::Process()
 									rdsvt.dsvt.flagb[2] = dstr.vpkt.snd_term_id;
 									memcpy(&rdsvt.dsvt.streamid, &dstr.vpkt.streamid, 44);
 									memset(rdsvt.dsvt.hdr.rpt1, ' ', CALL_SIZE);
-									memcpy(rdsvt.dsvt.hdr.rpt1, to_remote_g2[i].to_call, strlen(to_remote_g2[i].to_call));
+									memcpy(rdsvt.dsvt.hdr.rpt1, to_remote_g2[i].cs, strlen(to_remote_g2[i].cs));
 									rdsvt.dsvt.hdr.rpt1[7] = to_remote_g2[i].to_mod;
 									memset(rdsvt.dsvt.hdr.rpt2, ' ', CALL_SIZE);
-									memcpy(rdsvt.dsvt.hdr.rpt2, to_remote_g2[i].to_call, strlen(to_remote_g2[i].to_call));
+									memcpy(rdsvt.dsvt.hdr.rpt2, to_remote_g2[i].cs, strlen(to_remote_g2[i].cs));
 									rdsvt.dsvt.hdr.rpt2[7] = 'G';
 									memcpy(rdsvt.dsvt.hdr.urcall, "CQCQCQ  ", CALL_SIZE);
 									calcPFCS(rdsvt.dsvt.title, 56);
 
-									if (to_remote_g2[i].toDst4.sin_port == htons(rmt_xrf_port)) {
+									if (isxrf) {
 										/* inform XRF about the source */
 										rdsvt.dsvt.flagb[2] = to_remote_g2[i].from_mod;
 										calcPFCS(rdsvt.dsvt.title, 56);
 										for (int j=0; j<5; j++)
-											sendto(xrf_g2_sock, rdsvt.dsvt.title, 56, 0, (struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(struct sockaddr_in));
+											sendto(xrf_g2_sock, rdsvt.dsvt.title, 56, 0, to_remote_g2[i].addr.GetPointer(), sizeof(struct sockaddr_in));
 									} else {
 										for (int j=0; j<5; j++)
-											sendto(ref_g2_sock, rdsvt.head, 58, 0, (struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(struct sockaddr_in));
+											sendto(ref_g2_sock, rdsvt.head, 58, 0, to_remote_g2[i].addr.GetPointer(), sizeof(struct sockaddr_in));
 									}
-								} else if (to_remote_g2[i].toDst4.sin_port == htons(rmt_dcs_port)) {
+								} else if (rmt_dcs_port == to_remote_g2[i].addr.GetPort()) {
 									memcpy(rptr_2_dcs[i].mycall, dstr.vpkt.hdr.my, CALL_SIZE);
 									memcpy(rptr_2_dcs[i].sfx, dstr.vpkt.hdr.nm, 4);
 									rptr_2_dcs[i].dcs_rptr_seq = 0;
@@ -3032,7 +3000,7 @@ void CQnetLink::Process()
 
 						for (auto pos = inbound_list.begin(); pos != inbound_list.end(); pos++) {
 							SINBOUND *inbound = (SINBOUND *)pos->second;
-							sendto(ref_g2_sock, rdsvt.head, 29, 0, (struct sockaddr *)&(inbound->sin), sizeof(struct sockaddr_in));
+							sendto(ref_g2_sock, rdsvt.head, 29, 0, inbound->addr.GetPointer(), sizeof(struct sockaddr_in));
 						}
 					}
 
@@ -3056,12 +3024,12 @@ void CQnetLink::Process()
 
 								if (brd_from_rptr.to_rptr_streamid[0]) {
 									fromrptr_torptr_brd.streamid = brd_from_rptr.to_rptr_streamid[0];
-									sendto(xrf_g2_sock, fromrptr_torptr_brd.title, 27, 0, (struct sockaddr *)&toLocalg2,sizeof(struct sockaddr_in));
+									sendto(xrf_g2_sock, fromrptr_torptr_brd.title, 27, 0, toLocalg2.GetPointer(), toLocalg2.GetSize());
 								}
 
 								if (brd_from_rptr.to_rptr_streamid[1]) {
 									fromrptr_torptr_brd.streamid = brd_from_rptr.to_rptr_streamid[1];
-									sendto(xrf_g2_sock, fromrptr_torptr_brd.title, 27, 0, (struct sockaddr *)&toLocalg2,sizeof(struct sockaddr_in));
+									sendto(xrf_g2_sock, fromrptr_torptr_brd.title, 27, 0, toLocalg2.GetPointer(), toLocalg2.GetSize());
 								}
 
 								if (dstr.vpkt.ctrl & 0x40U) {
@@ -3070,7 +3038,8 @@ void CQnetLink::Process()
 								}
 							}
 
-							if (to_remote_g2[i].toDst4.sin_port==htons(rmt_xrf_port) || to_remote_g2[i].toDst4.sin_port== htons(rmt_ref_port)) {
+							const bool isxrf = (rmt_xrf_port == to_remote_g2[i].addr.GetPort());
+							if (isxrf || (rmt_ref_port == to_remote_g2[i].addr.GetPort())) {
 								SREFDSVT rdsvt;
 								rdsvt.head[0] = (unsigned char)(29 & 0xFF);
 								rdsvt.head[1] = (unsigned char)(29 >> 8 & 0x1F);
@@ -3089,19 +3058,19 @@ void CQnetLink::Process()
 								else
 									memcpy(rdsvt.dsvt.vasd.voice, dstr.vpkt.vasd1.voice, 12);
 
-								if (to_remote_g2[i].toDst4.sin_port == htons(rmt_xrf_port)) {
+								if (isxrf) {
 									/* inform XRF about the source */
 									rdsvt.dsvt.flagb[2] = to_remote_g2[i].from_mod;
 
-									sendto(xrf_g2_sock, rdsvt.dsvt.title, 27, 0, (struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(struct sockaddr_in));
-								} else if (to_remote_g2[i].toDst4.sin_port == htons(rmt_ref_port))
-									sendto(ref_g2_sock, rdsvt.head, 29, 0, (struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(struct sockaddr_in));
-							} else if (to_remote_g2[i].toDst4.sin_port == htons(rmt_dcs_port)) {
+									sendto(xrf_g2_sock, rdsvt.dsvt.title, 27, 0, to_remote_g2[i].addr.GetPointer(), sizeof(struct sockaddr_in));
+								} else if (rmt_ref_port == to_remote_g2[i].addr.GetPort())
+									sendto(ref_g2_sock, rdsvt.head, 29, 0, to_remote_g2[i].addr.GetPointer(), sizeof(struct sockaddr_in));
+							} else if (rmt_dcs_port == to_remote_g2[i].addr.GetPort()) {
 								memset(dcs_buf, 0x0, 600);
 								dcs_buf[0] = dcs_buf[1] = dcs_buf[2] = '0';
 								dcs_buf[3] = '1';
 								dcs_buf[4] = dcs_buf[5] = dcs_buf[6] = 0x0;
-								memcpy(dcs_buf + 7, to_remote_g2[i].to_call, 8);
+								memcpy(dcs_buf + 7, to_remote_g2[i].cs, 8);
 								dcs_buf[14] = to_remote_g2[i].to_mod;
 								memcpy(dcs_buf + 15, owner.c_str(), CALL_SIZE);
 								dcs_buf[22] = to_remote_g2[i].from_mod;
@@ -3121,7 +3090,7 @@ void CQnetLink::Process()
 								dcs_buf[61] = 0x01;
 								dcs_buf[62] = 0x00;
 
-								sendto(dcs_g2_sock, dcs_buf, 100, 0, (struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(to_remote_g2[i].toDst4));
+								sendto(dcs_g2_sock, dcs_buf, 100, 0, to_remote_g2[i].addr.GetPointer(), to_remote_g2[i].addr.GetSize());
 							}
 
 							if (dstr.vpkt.ctrl & 0x40U) {
@@ -3313,7 +3282,7 @@ void CQnetLink::AudioNotifyThread(SECHO &edata)
 		return;
 	}
 
-	sendto(rptr_sock, edata.header.title, 56, 0, (struct sockaddr *)&toLocalg2, sizeof(struct sockaddr_in));
+	sendto(rptr_sock, edata.header.title, 56, 0, toLocalg2.GetPointer(), toLocalg2.GetSize());
 
 	edata.header.config = 0x20U;
 
@@ -3376,7 +3345,7 @@ void CQnetLink::AudioNotifyThread(SECHO &edata)
 			}
 			if (count+1 == ambeblocks && ! edata.is_linked)
 				edata.header.ctrl |= 0x40U;
-			sendto(rptr_sock, edata.header.title, 27, 0, (struct sockaddr *)&toLocalg2, sizeof(struct sockaddr_in));
+			sendto(rptr_sock, edata.header.title, 27, 0, toLocalg2.GetPointer(), toLocalg2.GetSize());
 		}
 		std::this_thread::sleep_for(std::chrono::milliseconds(delay_between));
 	}
@@ -3429,7 +3398,7 @@ void CQnetLink::AudioNotifyThread(SECHO &edata)
 				memcpy(edata.header.vasd.text, edata.header.ctrl ? sdsilence : sdsync, 3);
 				if (i+1==size && lastch)
 					edata.header.ctrl |= 0x40U;	// signal the last voiceframe (of the last character)
-				sendto(rptr_sock, edata.header.title, 27, 0, (struct sockaddr *)&toLocalg2, sizeof(struct sockaddr_in));
+				sendto(rptr_sock, edata.header.title, 27, 0, toLocalg2.GetPointer(), toLocalg2.GetSize());
 			}
 			std::this_thread::sleep_for(std::chrono::milliseconds(delay_between));
 		}
@@ -3466,8 +3435,8 @@ bool CQnetLink::Init(const char *cfgfile)
 
 	for (int i=0; i<3; i++) {
 		notify_msg[i][0] = '\0';
-		to_remote_g2[i].to_call[0] = '\0';
-		memset(&(to_remote_g2[i].toDst4),0,sizeof(struct sockaddr_in));
+		to_remote_g2[i].cs[0] = '\0';
+		to_remote_g2[i].addr.Clear();
 		to_remote_g2[i].to_mod = to_remote_g2[i].from_mod = ' ';
 		to_remote_g2[i].countdown = 0;
 		to_remote_g2[i].is_connected = false;
@@ -3485,9 +3454,15 @@ bool CQnetLink::Init(const char *cfgfile)
 		printf("Failed to process config file %s\n", cfgfile);
 		return true;
 	}
-	print_status_file();
 
-	/* Open DB */
+	// open the database
+	std::string dbfilename(CFG_DIR);
+	dbfilename.append("/");
+	dbfilename.append(dash_sql_filename);
+	if (qnDB.Open(dbfilename.c_str()))
+		return true;
+
+	/* Open gwys.txt file */
 	if (!load_gwys(gwys))
 		return true;
 
@@ -3533,29 +3508,29 @@ void CQnetLink::Shutdown()
 	queryCommand[3] = 0;
 	queryCommand[4] = 0;
 	for (int i=0; i<3; i++) {
-		if (to_remote_g2[i].to_call[0] != '\0') {
-			if (to_remote_g2[i].toDst4.sin_port == htons(rmt_ref_port))
-				sendto(ref_g2_sock, queryCommand, 5, 0, (struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(to_remote_g2[i].toDst4));
-			else if (to_remote_g2[i].toDst4.sin_port == htons(rmt_xrf_port)) {
+		if (to_remote_g2[i].cs[0] != '\0') {
+			if (rmt_ref_port == to_remote_g2[i].addr.GetPort())
+				sendto(ref_g2_sock, queryCommand, 5, 0, to_remote_g2[i].addr.GetPointer(), to_remote_g2[i].addr.GetSize());
+			else if (rmt_xrf_port == to_remote_g2[i].addr.GetPort()) {
 				strcpy(unlink_request, owner.c_str());
 				unlink_request[8] = to_remote_g2[i].from_mod;
 				unlink_request[9] = ' ';
 				unlink_request[10] = '\0';
 				for (int j=0; j<5; j++)
-					sendto(xrf_g2_sock, unlink_request, CALL_SIZE+3, 0, (struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(to_remote_g2[i].toDst4));
+					sendto(xrf_g2_sock, unlink_request, CALL_SIZE+3, 0, to_remote_g2[i].addr.GetPointer(), to_remote_g2[i].addr.GetSize());
 			} else {
 				strcpy(cmd_2_dcs, owner.c_str());
 				cmd_2_dcs[8] = to_remote_g2[i].from_mod;
 				cmd_2_dcs[9] = ' ';
 				cmd_2_dcs[10] = '\0';
-				memcpy(cmd_2_dcs + 11, to_remote_g2[i].to_call, 8);
+				memcpy(cmd_2_dcs + 11, to_remote_g2[i].cs, 8);
 
 				for (int j=0; j<5; j++)
-					sendto(dcs_g2_sock, cmd_2_dcs, 19, 0, (struct sockaddr *)&(to_remote_g2[i].toDst4), sizeof(to_remote_g2[i].toDst4));
+					sendto(dcs_g2_sock, cmd_2_dcs, 19, 0, to_remote_g2[i].addr.GetPointer(), to_remote_g2[i].addr.GetSize());
 			}
 		}
-		to_remote_g2[i].to_call[0] = '\0';
-		memset(&(to_remote_g2[i].toDst4),0,sizeof(struct sockaddr_in));
+		to_remote_g2[i].cs[0] = '\0';
+		to_remote_g2[i].addr.Clear();
 		to_remote_g2[i].from_mod = to_remote_g2[i].to_mod = ' ';
 		to_remote_g2[i].countdown = 0;
 		to_remote_g2[i].is_connected = false;
@@ -3565,11 +3540,10 @@ void CQnetLink::Shutdown()
 	/* tell inbound dongles we are down */
 	for (auto pos = inbound_list.begin(); pos != inbound_list.end(); pos++) {
 		SINBOUND *inbound = (SINBOUND *)pos->second;
-		sendto(ref_g2_sock, queryCommand, 5, 0, (struct sockaddr *)&(inbound->sin), sizeof(struct sockaddr_in));
+		sendto(ref_g2_sock, queryCommand, 5, 0, inbound->addr.GetPointer(), sizeof(struct sockaddr_in));
 	}
 	inbound_list.clear();
 
-	print_status_file();
 	srv_close();
 
 	return;

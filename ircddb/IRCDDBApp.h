@@ -31,15 +31,10 @@ public:
 	void setSendQ(IRCMessageQueue *s);
 	IRCMessageQueue *getSendQ();
 
-	void putReplyMessage(IRCMessage *m);
 	void sendPing(const std::string &to, const std::string &from);
 
 	bool startWork();
 	void stopWork();
-
-	IRCDDB_RESPONSE_TYPE getReplyMessageType();
-
-	IRCMessage *getReplyMessage();
 
 	bool findUser(const std::string &s);
 
@@ -65,7 +60,6 @@ private:
 	std::string getLastEntryTime(int tableID);
 	std::future<void> worker_thread;
 	IRCMessageQueue *sendQ;
-	IRCMessageQueue replyQ;
 	CCacheManager *cache;
 
 	std::map<std::string, std::string> moduleMap;

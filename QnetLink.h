@@ -28,6 +28,8 @@
 #include "QnetTypeDefs.h"
 #include "SEcho.h"
 #include "Random.h"
+#include "QnetDB.h"
+#include "SockAddress.h"
 
 #define CALL_SIZE 8
 #define IP_SIZE 15
@@ -36,20 +38,36 @@
 #define TIMEOUT 50
 #define LH_MAX_SIZE 39
 
-typedef struct refdsvt_tag {
+using SREFDSVT = struct refdsvt_tag {
 	unsigned char head[2];
 	SDSVT dsvt;
-} SREFDSVT;
+};
 
 // This is the data payload in the map: inbound_list
 // This is for inbound dongles
-typedef struct inbound_tag {
+using SINBOUND = struct inbound_tag {
 	char call[CALL_SIZE + 1];	// the callsign of the remote
-	struct sockaddr_in sin;		// IP and port of remote
+	CSockAddress addr;			// IP and port of remote
 	short countdown;			// if countdown expires, the connection is terminated
 	char mod;					// A B C This user talked on this module
 	char client;				// dvap, dvdongle
-} SINBOUND;
+};
+
+using STOREMOTE = struct to_remote_g2_tag {
+    char cs[CALL_SIZE + 1];
+    CSockAddress addr;
+    char from_mod, to_mod;
+    short countdown;
+	bool auto_link, is_connected;
+    unsigned short in_streamid;  // incoming from remote systems
+    unsigned short out_streamid; // outgoing to remote systems
+};
+
+using STRACING = struct tracing_tag {
+	unsigned short streamid;
+	time_t last_time;	// last time RF user talked
+};
+
 
 class CQnetLink {
 public:
@@ -69,9 +87,8 @@ private:
 	void ToUpper(std::string &);
 	static void sigCatch(int signum);
 	void g2link(const char from_mod, const char *call, const char to_mod);
-	void print_status_file();
 	void send_heartbeat();
-	bool resolve_rmt(char *name, int type, struct sockaddr_in *addr);
+	bool resolve_rmt(const char *name, const unsigned short port, CSockAddress &addr);
 	void rptr_ack(short i);
 	void PlayAudioNotifyThread(char *msg);
 	void AudioNotifyThread(SECHO &edata);
@@ -80,10 +97,11 @@ private:
 	void PrintCallsigns(const std::string &key, const std::set<std::string> &set);
 
 	/* configuration data */
-	std::string login_call, owner, to_g2_internal_ip, my_g2_link_ip, gwys, status_file, qnvoice_file, announce_dir;
+	std::string login_call, owner, to_g2_internal_ip, my_g2_link_ip, gwys, qnvoice_file, announce_dir, dash_sql_filename;
 	bool only_admin_login, only_link_unlink, qso_details, bool_rptr_ack, announce;
-	bool dplus_authorize, dplus_reflectors, dplus_repeaters, dplus_priority, auto_link[3];
-	int rmt_xrf_port, rmt_ref_port, rmt_dcs_port, my_g2_link_port, to_g2_external_port, delay_between, delay_before;
+	bool dplus_authorize, dplus_reflectors, dplus_repeaters, dplus_priority;
+	unsigned short rmt_xrf_port, rmt_ref_port, rmt_dcs_port, my_g2_link_port, to_g2_external_port;
+	int delay_between, delay_before;
 	std::string link_at_startup[3];
 	unsigned int max_dongles, saved_max_dongles;
 	int rf_inactivity_timer[3];
@@ -98,16 +116,7 @@ private:
 
 	char notify_msg[3][64];
 
-	struct to_remote_g2_tag {
-		char to_call[CALL_SIZE + 1];
-		struct sockaddr_in toDst4;     // sin_port is in network byte order
-		char from_mod;
-		char to_mod;
-		short countdown;
-		bool is_connected;
-		unsigned short in_streamid;  // incoming from remote systems
-		unsigned short out_streamid; // outgoing to remote systems
-	} to_remote_g2[3];
+	STOREMOTE to_remote_g2[3];
 
 	// broadcast for data arriving from xrf to local rptr
 	struct brd_from_xrf_tag {
@@ -125,18 +134,15 @@ private:
 	SDSVT fromrptr_torptr_brd;
 	short brd_from_rptr_idx;
 
-	struct tracing_tag {
-		unsigned short streamid;
-		time_t last_time;	// last time RF user talked
-	} tracing[3];
+	STRACING tracing[3];
 
 	// input from remote
 	int xrf_g2_sock, ref_g2_sock, dcs_g2_sock, rptr_sock;
-	struct sockaddr_in fromDst4;
+	CSockAddress fromDst4;
 
 	// After we receive it from remote g2,
 	// we must feed it to our local repeater.
-	struct sockaddr_in toLocalg2;
+	CSockAddress toLocalg2;
 
 	// input from our own local repeater
 	struct sockaddr_in fromRptr;
@@ -170,6 +176,8 @@ private:
 	} old_sid[3];
 
 	CRandom Random;
+
+	CQnetDB qnDB;
 
 	std::vector<unsigned long> speak;
 };

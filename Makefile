@@ -20,6 +20,7 @@
 BINDIR=/usr/local/bin
 CFGDIR=/usr/local/etc
 SYSDIR=/lib/systemd/system
+WWWDIR=/usr/local/www
 IRC=ircddb
 
 # use this if you want debugging help in the case of a crash
@@ -30,8 +31,7 @@ CPPFLAGS=-W -Wall -std=c++11 -Iircddb -DCFG_DIR=\"$(CFGDIR)\"
 
 LDFLAGS=-L/usr/lib -lrt
 
-DSTROBJS = $(IRC)/dstar_dv.o $(IRC)/golay23.o
-IRCOBJS = $(IRC)/IRCDDB.o $(IRC)/IRCClient.o $(IRC)/IRCReceiver.o $(IRC)/IRCMessageQueue.o $(IRC)/IRCProtocol.o $(IRC)/IRCMessage.o $(IRC)/IRCDDBApp.o $(IRC)/IRCutils.o $(DSTROBJS)
+IRCOBJS = $(IRC)/IRCDDB.o $(IRC)/IRCClient.o $(IRC)/IRCReceiver.o $(IRC)/IRCMessageQueue.o $(IRC)/IRCProtocol.o $(IRC)/IRCMessage.o $(IRC)/IRCDDBApp.o $(IRC)/IRCutils.o
 SRCS = $(wildcard *.cpp) $(wildcard $(IRC)/*.cpp)
 OBJS = $(SRCS:.cpp=.o)
 DEPS = $(SRCS:.cpp=.d)
@@ -40,17 +40,17 @@ PROGRAMS=qngateway qnlink qnremote qnvoice
 
 all : $(PROGRAMS)
 
-qngateway : $(IRCOBJS) QnetGateway.o QnetConfigure.o aprs.o
-	g++ $(CPPFLAGS) -o qngateway QnetGateway.o QnetConfigure.o aprs.o $(IRCOBJS) $(LDFLAGS) -pthread
+qngateway : $(IRCOBJS) QnetGateway.o QnetConfigure.o aprs.o QnetDB.o DStarDecode.o TCPReaderWriterClient.o CacheManager.o
+	g++ $(CPPFLAGS) -o $@ $^ $(LDFLAGS) -l sqlite3 -pthread
 
-qnlink : QnetLink.o QnetConfigure.o DPlusAuthenticator.o TCPReaderWriterClient.o
-	g++ $(CPPFLAGS) -o qnlink QnetLink.o QnetConfigure.o DPlusAuthenticator.o TCPReaderWriterClient.o $(LDFLAGS) -pthread
+qnlink : QnetLink.o QnetConfigure.o DPlusAuthenticator.o TCPReaderWriterClient.o QnetDB.o
+	g++ $(CPPFLAGS) -o $@ $^ $(LDFLAGS) -l sqlite3 -pthread
 
 qnremote : QnetRemote.o QnetConfigure.o
-	g++ $(CPPFLAGS) -o qnremote QnetRemote.o QnetConfigure.o $(LDFLAGS)
+	g++ $(CPPFLAGS) -o $@ $^ $(LDFLAGS)
 
 qnvoice : QnetVoice.o QnetConfigure.o
-	g++ $(CPPFLAGS) -o qnvoice QnetVoice.o QnetConfigure.o $(LDFLAGS)
+	g++ $(CPPFLAGS) -o $@ $^ $(LDFLAGS)
 
 %.o : %.cpp
 	g++ $(CPPFLAGS) -MMD -MD -c $< -o $@
@@ -67,7 +67,8 @@ install : $(PROGRAMS) gwys.txt qn.cfg
 	/bin/cp -f qngateway $(BINDIR)
 	/bin/cp -f qnremote qnvoice $(BINDIR)
 	/bin/cp -f defaults $(CFGDIR)
-	/bin/ln -s $(shell pwd)/qn.cfg $(CFGDIR)
+	/bin/ln -f -s $(shell pwd)/qn.cfg $(CFGDIR)
+	/bin/ln -f -s $(shell pwd)/index.php $(WWWDIR)
 	/bin/cp -f system/qngateway.service $(SYSDIR)
 	systemctl enable qngateway.service
 	systemctl daemon-reload
@@ -88,6 +89,16 @@ installdtmf : qndtmf
 	systemctl enable qndtmf.service
 	systemctl daemon-reload
 	systemctl start qndtmf.service
+
+installdash : index.php
+	/usr/bin/apt update
+	/usr/bin/apt install -y php-common php-fpm sqlite3 php-sqlite3
+	mkdir -p $(WWWDIR)
+	/bin/ln -f -s $(shell pwd)/index.php $(WWWDIR)
+	/bin/cp -f system/qndash.service $(SYSDIR)
+	systemctl enable qndash.service
+	systemctl daemon-reload
+	systemctl start qndash.service
 
 uninstall :
 	######### QnetGateway #########
@@ -115,3 +126,11 @@ uninstalldtmf :
 	/bin/rm -f $(SYSDIR)/qndtmf.service
 	systemctl daemon-reload
 	/bin/rm -f $(BINDIR)/qndtmf
+
+uninstalldash :
+	systemctl stop qndash.service
+	systemctl disable qndash.service
+	/bin/rm -f $(SYSDIR)/qndash.service
+	systemctl daemon-reload
+	/bin/rm -f $(WWWDIR)/index.php
+	/bin/rm -f $(CFGDIR)/qn.db

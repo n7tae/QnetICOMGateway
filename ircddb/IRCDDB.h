@@ -4,11 +4,6 @@
 
 #include "../CacheManager.h"
 
-enum IRCDDB_RESPONSE_TYPE {
-	IDRT_NONE,
-	IDRT_PING
-};
-
 enum DSTAR_PROTOCOL {
 	DP_UNKNOWN,
 	DP_DEXTRA,
@@ -92,17 +87,6 @@ public:
 
 	// Send query for a user, a false return implies a network error
 	bool findUser(const std::string &userCallsign);
-
-	// The following functions are for processing received messages
-
-	// Get the waiting message type
-	IRCDDB_RESPONSE_TYPE getMessageType();
-
-	// Get a gateway message, as a result of IDRT_REPEATER returned from getMessageType()
-	// A false return implies a network error
-	bool receivePing(std::string &repeaterCallsign);
-
-	void sendPing(const std::string &to, const std::string &from);
 
 	void close();		// Implictely kills any threads in the IRC code
 

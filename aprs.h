@@ -29,27 +29,27 @@ enum aprs_level { al_none, al_$1, al_$2, al_c1, al_r1, al_c2, al_csum1, al_csum2
 
 enum slow_level { sl_first, sl_second };
 
-typedef struct portip_tag {
+using SPORTIP = struct portip_tag {
 	std::string ip;
-	int port;
-} SPORTIP;
+	unsigned short port;
+};
 
-typedef struct rptr_tag{
+using SMOD = struct mod_tag {
+	std::string call;   /* KJ4NHF-B */
+	bool defined;
+	std::string band;  /* 23cm ... */
+	double frequency, offset, latitude, longitude, range, agl;
+	std::string desc1, desc2, desc, url, package_version;
+	SPORTIP portip;
+};
+
+using SRPTR = struct rptr_tag{
 	SPORTIP aprs;
 	std::string aprs_filter;
 	int aprs_hash;
 	int aprs_interval;
-
-	/* 0=A, 1=B, 2=C */
-	struct mod_tag {
-		std::string call;   /* KJ4NHF-B */
-		bool defined;
-		std::string band;  /* 23cm ... */
-		double frequency, offset, latitude, longitude, range, agl;
-		std::string desc1, desc2, desc, url, package_version;
-		SPORTIP portip;
-	} mod[3];
-} SRPTR;
+	SMOD mod[3];
+};
 
 class CAPRS {
 public:

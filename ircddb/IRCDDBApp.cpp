@@ -138,34 +138,6 @@ int IRCDDBApp::getConnectionState()
 	return state;
 }
 
-IRCDDB_RESPONSE_TYPE IRCDDBApp::getReplyMessageType()
-{
-	IRCMessage * m = replyQ.peekFirst();
-	if (m == NULL) {
-		return IDRT_NONE;
-	}
-
-	std::string msgType = m->getCommand();
-
-	if (msgType == std::string("IDRT_PING")) {
-		return IDRT_PING;
-	}
-
-	printf("IRCDDBApp::getMessageType: unknown msg type: %s\n", msgType.c_str());
-
-	return IDRT_NONE;
-}
-
-IRCMessage *IRCDDBApp::getReplyMessage()
-{
-	return replyQ.getMessage();
-}
-
-void IRCDDBApp::putReplyMessage(IRCMessage *m)
-{
-	replyQ.putMessage(m);
-}
-
 bool IRCDDBApp::startWork()
 {
 	terminateThread = false;
@@ -543,18 +515,6 @@ void IRCDDBApp::msgQuery(IRCMessage *m)
 					restOfLine += " ";
 			}
 			doNotFound(restOfLine, callsign);
-
-			if (callsign.length() > 0) {
-				ReplaceChar(callsign, '_', ' ');
-
-				IRCMessage *m2 = new IRCMessage("IDRT_USER");
-				m2->addParam(callsign);
-				m2->addParam("");
-				m2->addParam("");
-				m2->addParam("");
-				m2->addParam("");
-				replyQ.putMessage(m2);
-			}
 		}
 	}
 }

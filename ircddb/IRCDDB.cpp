@@ -5,7 +5,6 @@
 #include "IRCutils.h"
 
 CIRCDDB::CIRCDDB(const std::string &hostName, unsigned int port, const std::string &callsign, const std::string &password, const std::string &versionInfo)
-
 {
 	const std::string update_channel("#dstar");
 
@@ -218,52 +217,6 @@ bool CIRCDDB::findUser(const std::string &userCallsign)
 	std::string ucs = userCallsign;
 	ToUpper(ucs);
 	return app->findUser(ucs);
-}
-
-// The following functions are for processing received messages
-
-// Get the waiting message type
-IRCDDB_RESPONSE_TYPE CIRCDDB::getMessageType()
-{
-	return app->getReplyMessageType();
-}
-
-bool CIRCDDB::receivePing(std::string &repeaterCallsign)
-{
-	IRCDDB_RESPONSE_TYPE rt = app->getReplyMessageType();
-
-	if (rt != IDRT_PING) {
-		printf("CIRCDDB::receivePing: unexpected response type\n");
-		return false;
-	}
-
-	IRCMessage *m = app->getReplyMessage();
-
-	if (NULL == m) {
-		printf("CIRCDDB::receivePing: no message\n");
-		return false;
-	}
-
-	if (m->getCommand().compare("IDRT_PING")) {
-		printf("CIRCDDB::receivePing: wrong messsage type\n");
-		return false;
-	}
-
-	if (1 != m->getParamCount()) {
-		printf("CIRCDDB::receivePing: unexpected number of message parameters\n");
-		return false;
-	}
-
-	repeaterCallsign = m->getParam(0);
-
-	delete m;
-
-	return true;
-}
-
-void CIRCDDB::sendPing(const std::string &to, const std::string &from)
-{
-	app->sendPing(to, from);
 }
 
 void CIRCDDB::close()		// Implictely kills any threads in the IRC code

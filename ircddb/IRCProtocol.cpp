@@ -169,12 +169,7 @@ bool IRCProtocol::processQueues(IRCMessageQueue *recvQ, IRCMessageQueue *sendQ)
 					if (0 == m->params[0].compare(channel)) {
 						app->msgChannel(m);
 					} else if (0 == m->params[0].compare(currentNick)) {
-						if (0 == m->params[1].find("IDRT_PING")) {
-							std::string from = m->params[1].substr(10);
-							IRCMessage *rm = new IRCMessage("IDRT_PING");
-							rm->addParam(from);
-							app->putReplyMessage(rm);
-						} else
+						if (m->params[1].find("IDRT_PING"))
 							app->msgQuery(m);
 					}
 				}
@@ -195,7 +190,7 @@ bool IRCProtocol::processQueues(IRCMessageQueue *recvQ, IRCMessageQueue *sendQ)
 		delete m;
 	}
 
-	IRCMessage * m;
+	IRCMessage *m;
 
 	switch (state) {
 	case 1:
