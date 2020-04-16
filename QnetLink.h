@@ -79,7 +79,7 @@ public:
 	void Shutdown();
 private:
 	// functions
-	bool load_gwys(const std::string &filename);
+	void LoadGateways(const std::string &filename);
 	void calcPFCS(unsigned char *packet, int len);
 	bool ReadConfig(const char *);
 	bool srv_open();
@@ -154,10 +154,6 @@ private:
 
 	// Used to validate incoming donglers
 	regex_t preg;
-
-	// the map of remotes
-	// key is the callsign, data is the host
-	std::map<std::string, std::string> gwy_list;
 
 	unsigned char queryCommand[QUERY_SIZE];
 
