@@ -1125,6 +1125,7 @@ void CQnetGateway::Process()
 							time(&toRptr[i].last_time);
 
 							toRptr[i].sequence = rptrbuf.vpkt.ctrl;
+							nextctrl[i] = 0U;	// ctrl of the next voice packet (used for healing code)
 						}
 					}
 				} else {	// g2buflen == 27
