@@ -54,9 +54,6 @@ gateway_longitude_d=0               # like the latitude
 gateway_desc1_d=''                  # maximum of 20 characters, most special symbols are not allowed
 gateway_desc2_d=''                  # just like desc1
 gateway_url_d='github.com/n7tae/QnetGateway' # 80 characters max
-gateway_healing_d=false     # Gateway healing performs two task on incoming voice streams:
-      # 1) Up to 5 consecutive missing voice packets will be replaced by silent voice packets
-      # 2) Voice packets that arrive late will be ignored (they have already been replaced by silent packets)
 
 ##########################################################################################################################
 #

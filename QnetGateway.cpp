@@ -217,7 +217,6 @@ bool CQnetGateway::read_config(char *cfgFile)
 	cfg.GetValue(path+"internal_ip",    estr, g2_internal.ip,    7, IP_SIZE);
 	cfg.GetValue(path+"internal_port",  estr, iport,          1024,   65535);
 	g2_internal.port = iport;
-	cfg.GetValue(path+"healing",        estr, GATEWAY_HEALING);
 	path.append("find_route");	// this has to be the last gateway_ key value
 	if (cfg.KeyExists(path)) {
 		std::string csv;
@@ -572,7 +571,7 @@ void CQnetGateway::ProcessTimeouts()
 				end_of_audio.vpkt.ctrl = toRptr[i].sequence | 0x40;
 
 				for (int j=0; j<2; j++)
-					sendto(srv_sock, end_of_audio.pkt_id, 29, 0, toRptr[i].addr.GetPointer(), toRptr[i].addr.GetSize());
+					sendto(srv_sock, end_of_audio.pkt_id, 29, 0, toRptr[i].addr.GetCPointer(), toRptr[i].addr.GetSize());
 
 
 				toRptr[i].streamid = 0;
@@ -971,7 +970,7 @@ void CQnetGateway::ProcessSlowData(unsigned char *data, unsigned short sid)
 /* run the main loop for QnetGateway */
 void CQnetGateway::Process()
 {
-	static unsigned char lastctrl = 20U;
+	static unsigned char nextctrl[3] = { 0, 0, 0 };
 	static std::string superframe[3];
 	// dtmf stuff
 	int dtmf_buf_count[3] = {0, 0, 0};
@@ -1015,7 +1014,7 @@ void CQnetGateway::Process()
 		memcpy(buf, "INIT", 4);
 		buf[6] = 0x73U;
 		// we can use the module a band_addr for INIT
-		sendto(srv_sock, buf, 10, 0, toRptr[avalidmodule].addr.GetPointer(), toRptr[avalidmodule].addr.GetSize());
+		sendto(srv_sock, buf, 10, 0, toRptr[avalidmodule].addr.GetCPointer(), toRptr[avalidmodule].addr.GetSize());
 		printf("Waiting for ICOM controller...\n");
 
 		// get the acknowledgement from the ICOM Stack
@@ -1050,7 +1049,7 @@ void CQnetGateway::Process()
 
 		// process packets coming from remote G2
 		if (FD_ISSET(g2_sock, &fdset)) {
-			static std::string lhcallsign, lhsfx;
+			static std::string lhcallsign[3], lhsfx[3];
 			SDSVT g2buf;
 			socklen_t fromlen = sizeof(struct sockaddr_storage);
 			int g2buflen = recvfrom(g2_sock, g2buf.title, 56, 0, fromDst4.GetPointer(), &fromlen);
@@ -1081,15 +1080,15 @@ void CQnetGateway::Process()
 							if (bool_qso_details)
 								printf("id=%04x G2 start, ur=%.8s r1=%.8s r2=%.8s my=%.8s/%.4s IP=[%s]:%u\n", ntohs(g2buf.streamid), g2buf.hdr.urcall, g2buf.hdr.rpt1, g2buf.hdr.rpt2, g2buf.hdr.mycall, g2buf.hdr.sfx, fromDst4.GetAddress(), fromDst4.GetPort());
 
-							lhcallsign.assign((const char *)g2buf.hdr.mycall, 8);
-							if (showLastHeard && memcmp(g2buf.hdr.sfx, "RPTR", 4) && std::regex_match(lhcallsign.c_str(), preg)) {
-								lhsfx.assign((const char *)g2buf.hdr.sfx, 4);
+							lhcallsign[i].assign((const char *)g2buf.hdr.mycall, 8);
+							if (showLastHeard && memcmp(g2buf.hdr.sfx, "RPTR", 4) && std::regex_match(lhcallsign[i].c_str(), preg)) {
+								lhsfx[i].assign((const char *)g2buf.hdr.sfx, 4);
 								std::string  reflector((const char *)g2buf.hdr.urcall, 8);
 								if (0 == reflector.compare("CQCQCQ  "))
 									set_dest_rptr('A'+i, reflector);
 								else if (0 == reflector.compare(OWNER))
 									reflector.assign("CSRoute");
-								qnDB.UpdateLH(lhcallsign.c_str(), lhsfx.c_str(), 'A'+i, reflector.c_str());
+								qnDB.UpdateLH(lhcallsign[i].c_str(), lhsfx[i].c_str(), 'A'+i, reflector.c_str());
 							}
 
 							memcpy(rptrbuf.pkt_id, "DSTR", 4);
@@ -1112,7 +1111,7 @@ void CQnetGateway::Process()
 							memcpy(rptrbuf.vpkt.hdr.my,   g2buf.hdr.mycall, 8);
 							memcpy(rptrbuf.vpkt.hdr.nm,   g2buf.hdr.sfx,    4);
 							memcpy(rptrbuf.vpkt.hdr.pfcs, g2buf.hdr.pfcs,   2);
-							sendto(srv_sock, rptrbuf.pkt_id, 58, 0, toRptr[i].addr.GetPointer(), toRptr[i].addr.GetSize());
+							sendto(srv_sock, rptrbuf.pkt_id, 58, 0, toRptr[i].addr.GetCPointer(), toRptr[i].addr.GetSize());
 
 							/* save the header */
 							memcpy(toRptr[i].saved_hdr, rptrbuf.pkt_id, 58);
@@ -1160,50 +1159,58 @@ void CQnetGateway::Process()
 								}
 							}
 
-							int diff = int(0x3FU & g2buf.ctrl) - int(lastctrl);
-							if (diff < 0)
-								diff += 21;
-							if (diff > 1 && diff < 6 && GATEWAY_HEALING) {	// fill up to 5 missing voice frames
-								if (bool_log_debug)
-									fprintf(stderr, "Warning: inserting %d missing voice frame(s)\n", diff - 1);
-								SDSTR dstr;
-								memcpy(dstr.pkt_id, rptrbuf.pkt_id, 16U);	// everything but the ctrl and voice data
-								while (--diff > 0) {
-									lastctrl = (lastctrl + 1U) % 21U;
-									dstr.counter = htons(G2_COUNTER_OUT++);
-									dstr.vpkt.ctrl = lastctrl;
-									if (dstr.vpkt.ctrl) {
-										const unsigned char silence[12] = { 0x9EU,0x8DU,0x32U,0x88U,0x26U,0x1AU,0x3FU,0x61U,0xE8U,0x70U,0x4FU,0x93U };
-										memcpy(dstr.vpkt.vasd.voice, silence, 12U);
-									} else {
-										const unsigned char sync[12] = { 0x9EU,0x8DU,0x32U,0x88U,0x26U,0x1AU,0x3FU,0x61U,0xE8U,0x55U,0x2DU,0x16U };
-										memcpy(dstr.vpkt.vasd.voice, sync, 12U);
+							int diff = int(0x1FU & g2buf.ctrl) - int(nextctrl[i]);
+							if (diff) {
+								if (diff < 0)
+									diff += 21;
+								if (diff < 6) {	// fill up to 5 missing voice frames
+									if (bool_log_debug)
+										fprintf(stderr, "Warning: inserting %d missing voice frame(s)\n", diff - 1);
+									SDSTR dstr;
+									memcpy(dstr.pkt_id, rptrbuf.pkt_id, 16U);	// everything but the ctrl and voice data
+									const unsigned char quite[9] = { 0x9EU, 0x8DU, 0x32U, 0x88U, 0x26U, 0x1AU, 0x3FU, 0x61U, 0xE8U };
+									memcpy(g2buf.vasd.voice, quite, 9);
+									while (diff-- > 0) {
+										dstr.counter = htons(G2_COUNTER_OUT++);
+										dstr.vpkt.ctrl = nextctrl[i]++;
+										nextctrl[i] %= 21U;
+										if (dstr.vpkt.ctrl) {
+											const unsigned char text[3] = { 0x70U, 0x4FU, 0x93U };
+											memcpy(dstr.vpkt.vasd.text, text, 3U);
+										} else {
+											const unsigned char sync[3] = { 0x55U, 0x2DU, 0x16U };
+											memcpy(dstr.vpkt.vasd.voice, sync, 3U);
+										}
+										sendto(srv_sock, rptrbuf.pkt_id, 29, 0, toRptr[i].addr.GetCPointer(), toRptr[i].addr.GetSize());
 									}
-									sendto(srv_sock, rptrbuf.pkt_id, 29, 0, toRptr[i].addr.GetPointer(), toRptr[i].addr.GetSize());
-								}
-							}
-
-							if (GATEWAY_HEALING) {
-								if (((lastctrl + 1U) % 21U == (0x3FU & g2buf.ctrl)) || (0x40U & g2buf.ctrl)) {
-									// no matter what, we will send this on if it is the closing frame
-									lastctrl = (0x3FU & g2buf.ctrl);
-									rptrbuf.counter = htons(G2_COUNTER_OUT++);
-									sendto(srv_sock, rptrbuf.pkt_id, 29, 0, toRptr[i].addr.GetPointer(), toRptr[i].addr.GetSize());
 								} else {
 									if (bool_log_debug)
-										fprintf(stderr, "Warning: Ignoring packet because its ctrl=0x%02xU and lastctrl=0x%02xU\n", g2buf.ctrl, lastctrl);
+										printf("missing %d packes from voice stream on module %c, resetting\n", diff, 'A'+i);
+									nextctrl[i] = g2buf.ctrl;
 								}
-							} else {
-								rptrbuf.counter = htons(G2_COUNTER_OUT++);
-								sendto(srv_sock, rptrbuf.pkt_id, 29, 0, toRptr[i].addr.GetPointer(), toRptr[i].addr.GetSize());
 							}
 
-							if (showLastHeard) {
-								std::string smartgroup;
-								if (ProcessG2Msg(g2buf.vasd.text, i, smartgroup)) {
-									qnDB.UpdateLH(lhcallsign.c_str(), lhsfx.c_str(), 'A'+i, smartgroup.c_str());
+							if ((nextctrl[i] == (0x1FU & g2buf.ctrl)) || (0x40U & g2buf.ctrl)) {
+								// no matter what, we will send this on if it is the closing frame
+								if (0x40U & g2buf.ctrl) {
+									g2buf.ctrl = (nextctrl[i] | 0x40U);
+								} else {
+									g2buf.ctrl = nextctrl[i];
+									nextctrl[i] = (nextctrl[i] + 1U) % 21U;
 								}
+								rptrbuf.counter = htons(G2_COUNTER_OUT++);
+								sendto(srv_sock, rptrbuf.pkt_id, 29, 0, toRptr[i].addr.GetCPointer(), toRptr[i].addr.GetSize());
+								if (showLastHeard) {
+									std::string smartgroup;
+									if (ProcessG2Msg(g2buf.vasd.text, i, smartgroup)) {
+										qnDB.UpdateLH(lhcallsign[i].c_str(), lhsfx[i].c_str(), 'A'+i, smartgroup.c_str());
+									}
+								}
+							} else {
+								if (bool_log_debug)
+									fprintf(stderr, "Warning: Ignoring packet because its ctrl=0x%02xU and nextctrl=0x%02xU\n", g2buf.ctrl, nextctrl[i]);
 							}
+
 
 							/* timeit */
 							time(&toRptr[i].last_time);
@@ -1249,7 +1256,7 @@ void CQnetGateway::Process()
 										toRptr[i].saved_hdr[5] = (unsigned char)((G2_COUNTER_OUT++) & 0xFFU);
 
 										/* re-generate/send the header */
-										sendto(srv_sock, toRptr[i].saved_hdr, 58, 0, toRptr[i].addr.GetPointer(), toRptr[i].addr.GetSize());
+										sendto(srv_sock, toRptr[i].saved_hdr, 58, 0, toRptr[i].addr.GetCPointer(), toRptr[i].addr.GetSize());
 
 										/* send this audio packet to repeater */
 										memcpy(rptrbuf.pkt_id, "DSTR", 4);
@@ -1261,7 +1268,7 @@ void CQnetGateway::Process()
 										rptrbuf.vpkt.icm_id = 0x20;
 										memcpy(&rptrbuf.vpkt.dst_rptr_id, g2buf.flagb, 18);
 
-										sendto(srv_sock, rptrbuf.pkt_id, 29, 0, toRptr[i].addr.GetPointer(), toRptr[i].addr.GetSize());
+										sendto(srv_sock, rptrbuf.pkt_id, 29, 0, toRptr[i].addr.GetCPointer(), toRptr[i].addr.GetSize());
 
 										/* make sure that any more audio arriving will be accepted */
 										toRptr[i].streamid = g2buf.streamid;
@@ -1307,7 +1314,7 @@ void CQnetGateway::Process()
 				} else if (0x73U==rptrbuf.flag[0] && (0x21U==rptrbuf.flag[1] || 0x11U==rptrbuf.flag[1] || 0x0U==rptrbuf.flag[1])) {
 					rptrbuf.flag[0] = 0x72U;
 					memset(rptrbuf.flag+1, 0x0U, 3);
-					sendto(srv_sock, rptrbuf.pkt_id, 10, 0, toRptr[avalidmodule].addr.GetPointer(), toRptr[avalidmodule].addr.GetSize());
+					sendto(srv_sock, rptrbuf.pkt_id, 10, 0, toRptr[avalidmodule].addr.GetCPointer(), toRptr[avalidmodule].addr.GetSize());
 				// end of ICOM handshaking
 				/////////////////////////////////////////////////////////////////////
 				} else if ( (recvlen==58 || recvlen==29 || recvlen==32) && rptrbuf.flag[0]==0x73 && rptrbuf.flag[1]==0x12 && rptrbuf.flag[2]==0x0 && rptrbuf.vpkt.icm_id==0x20 && (rptrbuf.remaining==0x30 || rptrbuf.remaining==0x13 || rptrbuf.remaining==0x16) ) {
@@ -1317,7 +1324,7 @@ void CQnetGateway::Process()
 						reply.counter = rptrbuf.counter;
 						reply.flag[0] = 0x72U;
 						memset(reply.flag+1, 0, 3);
-						sendto(srv_sock, reply.pkt_id, 10, 0, toRptr[avalidmodule].addr.GetPointer(), toRptr[avalidmodule].addr.GetSize());
+						sendto(srv_sock, reply.pkt_id, 10, 0, toRptr[avalidmodule].addr.GetCPointer(), toRptr[avalidmodule].addr.GetSize());
 					} while(false);
 
 					if (recvlen == 58) {
@@ -1394,7 +1401,7 @@ void CQnetGateway::Process()
 						bool mycall_valid = std::regex_match(user, preg);
 
 						if (mycall_valid)
-							sendto(srv_sock, rptrbuf.pkt_id, recvlen, 0, plug.GetPointer(), plug.GetSize());
+							sendto(srv_sock, rptrbuf.pkt_id, recvlen, 0, plug.GetCPointer(), plug.GetSize());
 						else
 							printf("MYCALL [%s] failed IRC expression validation\n", user.c_str());
 
@@ -1469,7 +1476,7 @@ void CQnetGateway::Process()
 
 												// send to remote gateway
 												for (int j=0; j<5; j++)
-													sendto(g2_sock, g2buf.title, 56, 0, to_remote_g2[i].addr.GetPointer(), to_remote_g2[i].addr.GetSize());
+													sendto(g2_sock, g2buf.title, 56, 0, to_remote_g2[i].addr.GetCPointer(), to_remote_g2[i].addr.GetSize());
 
 												printf("id=%04x Routing to IP=[%s]:%u ur=%.8s r1=%.8s r2=%.8s my=%.8s/%.4s\n", ntohs(g2buf.streamid), to_remote_g2[i].addr.GetAddress(), to_remote_g2[i].addr.GetPort(), g2buf.hdr.urcall, g2buf.hdr.rpt1, g2buf.hdr.rpt2, g2buf.hdr.mycall, g2buf.hdr.sfx);
 
@@ -1535,7 +1542,7 @@ void CQnetGateway::Process()
 
 												/* send to remote gateway */
 												for (int j=0; j<5; j++)
-													sendto(g2_sock, g2buf.title, 56, 0, to_remote_g2[i].addr.GetPointer(), to_remote_g2[i].addr.GetSize());
+													sendto(g2_sock, g2buf.title, 56, 0, to_remote_g2[i].addr.GetCPointer(), to_remote_g2[i].addr.GetSize());
 
 												printf("Routing to IP=[%s]:%u id=%04x my=%.8s/%.4s ur=%.8s rpt1=%.8s rpt2=%.8s\n", to_remote_g2[i].addr.GetAddress(), to_remote_g2[i].addr.GetPort(), ntohs(g2buf.streamid), g2buf.hdr.mycall, g2buf.hdr.sfx, g2buf.hdr.urcall, g2buf.hdr.rpt1, g2buf.hdr.rpt2);
 
@@ -1573,7 +1580,7 @@ void CQnetGateway::Process()
 														rptrbuf.vpkt.hdr.r1[7] = 'G';
 														calcPFCS(rptrbuf.pkt_id, 58);
 
-														sendto(srv_sock, rptrbuf.pkt_id, 58, 0, toRptr[i].addr.GetPointer(), toRptr[i].addr.GetSize());
+														sendto(srv_sock, rptrbuf.pkt_id, 58, 0, toRptr[i].addr.GetCPointer(), toRptr[i].addr.GetSize());
 
 														/* This is the active streamid */
 														toRptr[i].streamid = rptrbuf.vpkt.streamid;
@@ -1743,7 +1750,7 @@ void CQnetGateway::Process()
 									rptrbuf.vpkt.hdr.r1[7] = 'G';
 									calcPFCS(rptrbuf.pkt_id, 58);
 
-									sendto(srv_sock, rptrbuf.pkt_id, 58, 0, toRptr[i].addr.GetPointer(), toRptr[i].addr.GetSize());
+									sendto(srv_sock, rptrbuf.pkt_id, 58, 0, toRptr[i].addr.GetCPointer(), toRptr[i].addr.GetSize());
 
 									/* This is the active streamid */
 									toRptr[i].streamid = rptrbuf.vpkt.streamid;
@@ -1873,7 +1880,7 @@ void CQnetGateway::Process()
 							ProcessSlowData(rptrbuf.vpkt.vasd1.text, rptrbuf.vpkt.streamid);
 
 						/* send data to qnlink */
-						sendto(srv_sock, rptrbuf.pkt_id, recvlen, 0, plug.GetPointer(), plug.GetSize());
+						sendto(srv_sock, rptrbuf.pkt_id, recvlen, 0, plug.GetCPointer(), plug.GetSize());
 
 						/* aprs processing */
 						if (bool_send_aprs)
@@ -1898,7 +1905,7 @@ void CQnetGateway::Process()
 								auto pos = portmap.find(addr);
 								auto port = (pos==portmap.end()) ? g2_external.port : pos->second;
 								to_remote_g2[i].addr.Initialize(family, port, addr.c_str());
-								sendto(g2_sock, g2buf.title, 27, 0, to_remote_g2[i].addr.GetPointer(), to_remote_g2[i].addr.GetSize());
+								sendto(g2_sock, g2buf.title, 27, 0, to_remote_g2[i].addr.GetCPointer(), to_remote_g2[i].addr.GetSize());
 
 								time(&(to_remote_g2[i].last_time));
 
@@ -1955,7 +1962,7 @@ void CQnetGateway::Process()
 								break;
 							}
 							else if ((toRptr[i].streamid==rptrbuf.vpkt.streamid) && (toRptr[i].adr == fromRptr)) {	// or maybe this is cross-banding data
-								sendto(srv_sock, rptrbuf.pkt_id, 29, 0, toRptr[i].addr.GetPointer(), toRptr[i].addr.GetSize());
+								sendto(srv_sock, rptrbuf.pkt_id, 29, 0, toRptr[i].addr.GetCPointer(), toRptr[i].addr.GetSize());
 
 								/* timeit */
 								time(&toRptr[i].last_time);
@@ -2277,7 +2284,7 @@ void CQnetGateway::PlayFileThread(SECHO &edata)
 	memcpy(dstr.vpkt.hdr.nm,   edata.header.hdr.sfx,    4);
 	calcPFCS(dstr.pkt_id, 58);
 
-	sendto(srv_sock, dstr.pkt_id, 58, 0, toRptr[mod].addr.GetPointer(), toRptr[mod].addr.GetSize());
+	sendto(srv_sock, dstr.pkt_id, 58, 0, toRptr[mod].addr.GetCPointer(), toRptr[mod].addr.GetSize());
 
 	dstr.remaining = 0x13U;
 
@@ -2339,7 +2346,7 @@ void CQnetGateway::PlayFileThread(SECHO &edata)
 			if (i+1 == ambeblocks)
 				dstr.vpkt.ctrl |= 0x40U;
 
-			sendto(srv_sock, dstr.pkt_id, 29, 0, toRptr[mod].addr.GetPointer(), toRptr[mod].addr.GetSize());
+			sendto(srv_sock, dstr.pkt_id, 29, 0, toRptr[mod].addr.GetCPointer(), toRptr[mod].addr.GetSize());
 
 			std::this_thread::sleep_for(std::chrono::milliseconds(play_delay));
 		}

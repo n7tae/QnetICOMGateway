@@ -99,7 +99,7 @@ private:
 
 	std::string OWNER, owner, dtmf_dir, dtmf_file, echotest_dir, irc_pass, qnvoicefile, DASH_SHOW_ORDER, DASH_SQL_NAME;
 
-	bool bool_send_qrgs, bool_irc_debug, bool_log_debug, bool_dtmf_debug, bool_regen_header, bool_qso_details, bool_send_aprs, playNotInCache, GATEWAY_HEALING, showLastHeard;
+	bool bool_send_qrgs, bool_irc_debug, bool_log_debug, bool_dtmf_debug, bool_regen_header, bool_qso_details, bool_send_aprs, playNotInCache, showLastHeard;
 
 	int play_wait, play_delay, echotest_rec_timeout, voicemail_rec_timeout, from_remote_g2_timeout, from_local_rptr_timeout, dtmf_digit;
 

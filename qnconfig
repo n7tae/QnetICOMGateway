@@ -300,7 +300,6 @@ GateMenu () {
 			echo -n "na : G2 internal port address       = "; EvaluateVar gateway_internal_ip{,_d}
 			echo -n "np : G2 internal port number        = "; EvaluateVar gateway_internal_port{,_d}
 		fi
-		echo -n "he : Gateway G2 healing             = "; EvaluateVar gateway_healing{,_d}
 		echo -n "la : Latitude (-90.0 to 90.0)       = "; EvaluateVar gateway_latitude{,_d}
 		echo -n "lo : Longitude (-180.0 to 180.0)    = "; EvaluateVar gateway_longitude{,_d}
 		echo -n "d1 : Description #1 (20 chars max)  = "; EvaluateVar gateway_desc1{,_d}
@@ -327,7 +326,6 @@ GateMenu () {
 		elif [[ "$key" == xp* ]]; then gateway_external_port="$value"
 		elif [[ "$key" == na* ]]; then gateway_internal_ip="$value"
 		elif [[ "$key" == np* ]]; then gateway_internal_port="$value"
-		elif [[ "$key" == he* ]]; then SetBooleanValue gateway_healing "$value"
 		elif [[ "$key" == la* ]]; then gateway_latitude="$value"
 		elif [[ "$key" == lo* ]]; then gateway_longitude="$value"
 		elif [[ "$key" == d1* ]]; then gateway_desc1="${value:0:20}"
@@ -347,7 +345,6 @@ GateMenu () {
 			elif [[ "$value" == xp* ]]; then unset gateway_external_port
 			elif [[ "$value" == na* ]]; then unset gateway_internal_ip
 			elif [[ "$value" == np* ]]; then unset gateway_internal_port
-			elif [[ "$value" == he* ]]; then unset gateway_healing
 			elif [[ "$value" == la* ]]; then unset gateway_latitude
 			elif [[ "$value" == lo* ]]; then unset gateway_longitude
 			elif [[ "$value" == d1* ]]; then unset gateway_desc1
@@ -481,7 +478,6 @@ WriteCFGFile () {
 	[ -z "${gateway_internal_port+x}"  ] || echo "gateway_internal_port=${gateway_internal_port}"   >> $outFile
 	[ -z "${gateway_external_ip+x}"    ] || echo "gateway_external_ip=${gateway_external_ip}"       >> $outFile
 	[ -z "${gateway_external_port+x}"  ] || echo "gateway_external_port=${gateway_external_port}"   >> $outFile
-	[ -z "${gateway_healing+x}"        ] || echo "gateway_healing=${gateway_healing}"               >> $outFile
 	[ -z "${gateway_latitude+x}"       ] || echo "gateway_latitude=${gateway_latitude}"             >> $outFile
 	[ -z "${gateway_longitude+x}"      ] || echo "gateway_longitude=${gateway_longitude}"           >> $outFile
 	[ -z "${gateway_desc1+x}"          ] || echo "gateway_desc1='${gateway_desc1}'"                 >> $outFile
