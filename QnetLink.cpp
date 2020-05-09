@@ -142,7 +142,7 @@ void CQnetLink::send_heartbeat()
 	}
 }
 
-void CQnetLink::rptr_ack(short i)
+void CQnetLink::rptr_ack(int i)
 {
 	static char mod_and_RADIO_ID[3][22];
 
@@ -921,6 +921,7 @@ void CQnetLink::Process()
 	}
 
 	while (keep_running) {
+		static bool loadG[3] = { false, false, false };
 		time(&tnow);
 		if ((tnow - hb) > 0) {
 			/* send heartbeat to connected donglers */
@@ -2758,26 +2759,37 @@ void CQnetLink::Process()
 							}
 						}
 						else if (0==memcmp(dstr.vpkt.hdr.ur, "      ", 6) && dstr.vpkt.hdr.ur[7]=='X' && admin.find(call)!=admin.end()) { // only ADMIN can execute scripts
-							if (dstr.vpkt.hdr.ur[6] != ' ') {
-								memset(system_cmd, '\0', sizeof(system_cmd));
-								snprintf(system_cmd, FILENAME_MAX, "%s/exec_%c.sh %s %c &", announce_dir.c_str(), dstr.vpkt.hdr.ur[6], call.c_str(), dstr.vpkt.hdr.r1[7]);
-								printf("Executing %s\n", system_cmd);
-								system(system_cmd);
+							if (admin.size()>0 && admin.find(call)==admin.end()) {
+								printf("%s is not in admin set, ignoring request to execute script '%c'\n", call, dstr.vpkt.hdr.ur[6]);
+							} else {
+								if (dstr.vpkt.hdr.ur[6] != ' ') {
+									memset(system_cmd, '\0', sizeof(system_cmd));
+									snprintf(system_cmd, FILENAME_MAX, "%s/exec_%c.sh %s %c &", announce_dir.c_str(), dstr.vpkt.hdr.ur[6], call.c_str(), dstr.	vpkt.hdr.r1[7]);
+									printf("Executing %s\n", system_cmd);
+									system(system_cmd);
+								}
 							}
 						}
-						else if (0==memcmp(dstr.vpkt.hdr.ur, "      ", 6) && dstr.vpkt.hdr.ur[6]=='D' && admin.find(call)!=admin.end()) { // only ADMIN can block dongle users
-							if (dstr.vpkt.hdr.ur[7] == '1') {
-								max_dongles = saved_max_dongles;
-								printf("Dongle connections are now allowed\n");
-							} else if (dstr.vpkt.hdr.ur[7] == '0') {
-								inbound_list.clear();
-								max_dongles = 0;
-								printf("Dongle connections are now disallowed\n");
+						else if (0==memcmp(dstr.vpkt.hdr.ur, "      ", 6) && dstr.vpkt.hdr.ur[6]=='D') { // only ADMIN can block dongle users
+							if (admin.size()>0 && admin.find(call)==admin.end()) {
+								printf("%s is not in admin set, ignoring request to set dongle linking\n", call);
+							} else {
+								if (dstr.vpkt.hdr.ur[7] == '1') {
+									max_dongles = saved_max_dongles;
+									printf("Dongle connections are now allowed\n");
+								} else if (dstr.vpkt.hdr.ur[7] == '0') {
+									inbound_list.clear();
+									max_dongles = 0;
+									printf("Dongle connections are now disallowed\n");
+								}
 							}
 						}
-						else if (0==memcmp(dstr.vpkt.hdr.ur, "       F", CALL_SIZE) && admin.find(call)!=admin.end()) { // only ADMIN can reload gwys.txt
-							qnDB.ClearGW();
-							LoadGateways(gwys);
+						else if (0==memcmp(dstr.vpkt.hdr.ur, "       F", CALL_SIZE)) { // only ADMIN can reload gwys.txt
+							if (admin.size()>0 && admin.end()==admin.find(call)) {
+								printf("%s is not in admin set, ignoring request to re-read gwys.txt\n", call);
+							} else {
+								loadG[i] = true;
+							}
 						}
 					}
 
@@ -3097,6 +3109,12 @@ void CQnetLink::Process()
 			if (notify_msg[i][0] && 0x0U == tracing[i].streamid) {
 				PlayAudioNotifyThread(notify_msg[i]);
 				notify_msg[i][0] = '\0';
+			}
+			if (loadG[i] && 0x0U == tracing[i].streamid) {
+				qnDB.ClearGW();
+				LoadGateways(gwys);
+				loadG[i] = false;
+				rptr_ack(i);
 			}
 		}
 	}
