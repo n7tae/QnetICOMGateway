@@ -2760,7 +2760,7 @@ void CQnetLink::Process()
 						}
 						else if (0==memcmp(dstr.vpkt.hdr.ur, "      ", 6) && dstr.vpkt.hdr.ur[7]=='X' && admin.find(call)!=admin.end()) { // only ADMIN can execute scripts
 							if (admin.size()>0 && admin.find(call)==admin.end()) {
-								printf("%s is not in admin set, ignoring request to execute script '%c'\n", call, dstr.vpkt.hdr.ur[6]);
+								printf("%s is not in admin set, ignoring request to execute script '%c'\n", call.c_str(), dstr.vpkt.hdr.ur[6]);
 							} else {
 								if (dstr.vpkt.hdr.ur[6] != ' ') {
 									memset(system_cmd, '\0', sizeof(system_cmd));
@@ -2772,7 +2772,7 @@ void CQnetLink::Process()
 						}
 						else if (0==memcmp(dstr.vpkt.hdr.ur, "      ", 6) && dstr.vpkt.hdr.ur[6]=='D') { // only ADMIN can block dongle users
 							if (admin.size()>0 && admin.find(call)==admin.end()) {
-								printf("%s is not in admin set, ignoring request to set dongle linking\n", call);
+								printf("%s is not in admin set, ignoring request to set dongle linking\n", call.c_str());
 							} else {
 								if (dstr.vpkt.hdr.ur[7] == '1') {
 									max_dongles = saved_max_dongles;
@@ -2786,7 +2786,7 @@ void CQnetLink::Process()
 						}
 						else if (0==memcmp(dstr.vpkt.hdr.ur, "       F", CALL_SIZE)) { // only ADMIN can reload gwys.txt
 							if (admin.size()>0 && admin.end()==admin.find(call)) {
-								printf("%s is not in admin set, ignoring request to re-read gwys.txt\n", call);
+								printf("%s is not in admin set, ignoring request to re-read gwys.txt\n", call.c_str());
 							} else {
 								loadG[i] = true;
 							}
