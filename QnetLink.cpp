@@ -54,7 +54,7 @@
 #include "QnetLink.h"
 #include "Utilities.h"
 
-#define VERSION "1.10"
+#define VERSION "1.20"
 
 #ifndef CFG_DIR
 #define CFG_DIR "/usr/local/etc"
@@ -3398,6 +3398,8 @@ bool CQnetLink::Init(const char *cfgfile)
 	dbfilename.append(dash_sql_filename);
 	if (qnDB.Open(dbfilename.c_str()))
 		return true;
+	qnDB.ClearGW();
+	qnDB.ClearLS();
 
 	/* Open gwys.txt file */
 	LoadGateways(gwys);

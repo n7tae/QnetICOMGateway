@@ -56,7 +56,7 @@
 #include "QnetConfigure.h"
 #include "QnetDB.h"
 
-#define VERSION "QnetIcomGateway-405"
+#define VERSION "QnetIcomGateway-511"
 
 #ifndef CFG_DIR
 #define CFG_DIR "/usr/local/etc"
@@ -2429,8 +2429,9 @@ bool CQnetGateway::Init(char *cfgfile)
 	std::string dbfilename(CFG_DIR);
 	dbfilename.append("/");
 	dbfilename.append(DASH_SQL_NAME);
-	if (qnDB.Open(dbfilename.c_str()) || qnDB.Init())
+	if (qnDB.Open(dbfilename.c_str()))
 		return true;
+	qnDB.ClearLH();
 
 	playNotInCache = false;
 
