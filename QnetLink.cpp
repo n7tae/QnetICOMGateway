@@ -1392,9 +1392,8 @@ void CQnetLink::Process()
 							SINBOUND *inbound = (SINBOUND *)pos->second;
 							if (addr.compare(inbound->addr.GetAddress())) {
 								SREFDSVT rdsvt;
-								rdsvt.head[0] = (unsigned char)(58 & 0xFF);
-								rdsvt.head[1] = (unsigned char)(58 >> 8 & 0x1F);
-								rdsvt.head[1] = (unsigned char)(rdsvt.head[1] | 0xFFFFFF80);
+								rdsvt.head[0] = 58U;
+								rdsvt.head[1] = 0x80U;
 								memcpy(rdsvt.dsvt.title, dsvt.title, 56);
 
 								sendto(ref_g2_sock, rdsvt.head, 58, 0, inbound->addr.GetPointer(), sizeof(struct sockaddr_in));
@@ -1485,9 +1484,8 @@ void CQnetLink::Process()
 									to_remote_g2[i].in_streamid = dsvt.streamid;
 
 									SREFDSVT rdsvt;
-									rdsvt.head[0] = (unsigned char)(58 & 0xFF);
-									rdsvt.head[1] = (unsigned char)(58 >> 8 & 0x1F);
-									rdsvt.head[1] = (unsigned char)(rdsvt.head[1] | 0xFFFFFF80);
+									rdsvt.head[0] = 58U;
+									rdsvt.head[1] = 0x80U;
 
 									memcpy(rdsvt.dsvt.title, dsvt.title, 56);
 
@@ -1543,13 +1541,14 @@ void CQnetLink::Process()
 						SINBOUND *inbound = (SINBOUND *)pos->second;
 						if (addr.compare(inbound->addr.GetAddress())) {
 							SREFDSVT rdsvt;
-							rdsvt.head[0] = (unsigned char)(29 & 0xFF);
-							rdsvt.head[1] = (unsigned char)(29 >> 8 & 0x1F);
-							rdsvt.head[1] = (unsigned char)(rdsvt.head[1] | 0xFFFFFF80);
+							rdsvt.head[0] = (dsvt.ctrl & 0x40U) ? 32U : 29U;
+							rdsvt.head[1] = 0x80U;
 
 							memcpy(rdsvt.dsvt.title, dsvt.title, 27);
+							if (dsvt.ctrl & 0x40U)
+								memcpy(rdsvt.dsvt.vend.end, endbytes, 6);
 
-							sendto(ref_g2_sock, rdsvt.head, 29, 0, inbound->addr.GetPointer(), sizeof(struct sockaddr_in));
+							sendto(ref_g2_sock, rdsvt.head, rdsvt.head[0], 0, inbound->addr.GetPointer(), sizeof(struct sockaddr_in));
 						}
 					}
 
@@ -1582,13 +1581,14 @@ void CQnetLink::Process()
 								sendto(xrf_g2_sock, dsvt.title, 27, 0, to_remote_g2[i].addr.GetPointer(), sizeof(struct sockaddr_in));
 							} else if (rmt_ref_port == to_remote_g2[i].addr.GetPort()) {
 								SREFDSVT rdsvt;
-								rdsvt.head[0] = (unsigned char)(29 & 0xFF);
-								rdsvt.head[1] = (unsigned char)(29 >> 8 & 0x1F);
-								rdsvt.head[1] = (unsigned char)(rdsvt.head[1] | 0xFFFFFF80);
+								rdsvt.head[0] = (dsvt.ctrl & 0x40U) ? 32U : 29U;
+								rdsvt.head[1] = 0x80U;
 
 								memcpy(rdsvt.dsvt.title, dsvt.title, 27);
+								if (dsvt.ctrl & 0x40U)
+									memcpy(rdsvt.dsvt.vend.end, endbytes, 6);
 
-								sendto(ref_g2_sock, rdsvt.head, 29, 0, to_remote_g2[i].addr.GetPointer(), sizeof(struct sockaddr_in));
+								sendto(ref_g2_sock, rdsvt.head, rdsvt.head[0], 0, to_remote_g2[i].addr.GetPointer(), sizeof(struct sockaddr_in));
 							} else if (rmt_dcs_port == to_remote_g2[i].addr.GetPort()) {
 								memset(dcs_buf, 0x00, 600);
 								dcs_buf[0] = dcs_buf[1] = dcs_buf[2] = '0';
@@ -2155,7 +2155,8 @@ void CQnetLink::Process()
 					}
 				}
 
-				SREFDSVT rdsvt; memcpy(rdsvt.head, buf, length);	// copy to struct
+				SREFDSVT rdsvt;
+				memcpy(rdsvt.head, buf, length);	// copy to struct
 
 				if (length==58 && found) {
 					memset(source_stn, ' ', 9);
@@ -2312,7 +2313,7 @@ void CQnetLink::Process()
 					for (pos = inbound_list.begin(); pos != inbound_list.end(); pos++) {
 						SINBOUND *inbound = (SINBOUND *)pos->second;
 						if (addr.compare(inbound->addr.GetAddress())) {
-							sendto(ref_g2_sock, rdsvt.head, 29, 0, inbound->addr.GetPointer(), sizeof(struct sockaddr_in));
+							sendto(ref_g2_sock, rdsvt.head, rdsvt.head[0], 0, inbound->addr.GetPointer(), sizeof(struct sockaddr_in));
 						}
 					}
 
@@ -2323,7 +2324,7 @@ void CQnetLink::Process()
 								rdsvt.dsvt.flagb[2] = to_remote_g2[i].from_mod;
 								sendto(xrf_g2_sock, rdsvt.dsvt.title, 27, 0, to_remote_g2[i].addr.GetPointer(), sizeof(struct sockaddr_in));
 							} else if (rmt_ref_port == to_remote_g2[i].addr.GetPort())
-								sendto(ref_g2_sock, rdsvt.head, 29,  0,to_remote_g2[i].addr.GetPointer(), sizeof(struct sockaddr_in));
+								sendto(ref_g2_sock, rdsvt.head, rdsvt.head[0],  0,to_remote_g2[i].addr.GetPointer(), sizeof(struct sockaddr_in));
 							else if (rmt_dcs_port == to_remote_g2[i].addr.GetPort()) {
 								memset(dcs_buf, 0x00, 600);
 								dcs_buf[0] = dcs_buf[1] = dcs_buf[2] = '0';
@@ -2429,9 +2430,8 @@ void CQnetLink::Process()
 
 							/* generate our header */
 							SREFDSVT rdsvt;
-							rdsvt.head[0] = (unsigned char)(58 & 0xFF);
-							rdsvt.head[1] = (unsigned char)(58 >> 8 & 0x1F);
-							rdsvt.head[1] = (unsigned char)(rdsvt.head[1] | 0xFFFFFF80);
+							rdsvt.head[0] = 58U;
+							rdsvt.head[1] = 0x80U;
 							memcpy(rdsvt.dsvt.title, "DSVT", 4);
 							rdsvt.dsvt.config = 0x10;
 							rdsvt.dsvt.flaga[0] = rdsvt.dsvt.flaga[1] = rdsvt.dsvt.flaga[2] = 0x00;
@@ -2471,9 +2471,8 @@ void CQnetLink::Process()
 						if (0==memcmp(&to_remote_g2[i].in_streamid, dcs_buf+43, 2) && dcs_seq[i]!=dcs_buf[45]) {
 							dcs_seq[i] = dcs_buf[45];
 							SREFDSVT rdsvt;
-							rdsvt.head[0] = (unsigned char)(29 & 0xFF);
-							rdsvt.head[1] = (unsigned char)(29 >> 8 & 0x1F);
-							rdsvt.head[1] = (unsigned char)(rdsvt.head[1] | 0xFFFFFF80);
+							rdsvt.head[0] = (dcs_buf[45] & 0x40U) ? 32U : 29U;
+							rdsvt.head[1] = 0x80U;
 							memcpy(rdsvt.dsvt.title, "DSVT", 4);
 							rdsvt.dsvt.config = 0x20;
 							rdsvt.dsvt.flaga[0] = rdsvt.dsvt.flaga[1] = rdsvt.dsvt.flaga[2] = 0x00;
@@ -2492,11 +2491,13 @@ void CQnetLink::Process()
 
 							/* send the data to the local gateway/repeater */
 							sendto(rptr_sock, rdsvt.dsvt.title, 27, 0, toLocalg2.GetPointer(), toLocalg2.GetSize());
+							if (32U == rdsvt.head[0])
+								memcpy(rdsvt.dsvt.vend.end, endbytes, 6);
 
 							/* send the data to the donglers */
 							for (auto pos = inbound_list.begin(); pos != inbound_list.end(); pos++) {
 								SINBOUND *inbound = (SINBOUND *)pos->second;
-								sendto(ref_g2_sock, rdsvt.head, 29, 0, inbound->addr.GetPointer(), sizeof(struct sockaddr_in));
+								sendto(ref_g2_sock, rdsvt.head, rdsvt.head[0], 0, inbound->addr.GetPointer(), sizeof(struct sockaddr_in));
 							}
 
 							if ((dcs_buf[45] & 0x40) != 0) {
@@ -2796,9 +2797,8 @@ void CQnetLink::Process()
 					/* send data to the donglers */
 					SREFDSVT rdsvt;
 					if (inbound_list.size() > 0) {
-						rdsvt.head[0] = (unsigned char)(58 & 0xFF);
-						rdsvt.head[1] = (unsigned char)(58 >> 8 & 0x1F);
-						rdsvt.head[1] = (unsigned char)(rdsvt.head[1] | 0xFFFFFF80);
+						rdsvt.head[0] = 58U;
+						rdsvt.head[1] = 0x80U;
 
 						memcpy(rdsvt.dsvt.title, "DSVT", 4);
 						rdsvt.dsvt.config = 0x10;
@@ -2869,9 +2869,8 @@ void CQnetLink::Process()
 								const bool isxrf = (rmt_xrf_port == to_remote_g2[i].addr.GetPort());
 								if (isxrf || (rmt_ref_port == to_remote_g2[i].addr.GetPort())) {
 									SREFDSVT rdsvt;
-									rdsvt.head[0] = (unsigned char)(58 & 0xFF);
-									rdsvt.head[1] = (unsigned char)(58 >> 8 & 0x1F);
-									rdsvt.head[1] = (unsigned char)(rdsvt.head[1] | 0xFFFFFF80);
+									rdsvt.head[0] = 58U;
+									rdsvt.head[1] = 0x80U;
 
 									memcpy(rdsvt.dsvt.title, "DSVT", 4);
 									rdsvt.dsvt.config = 0x10;
@@ -2912,9 +2911,8 @@ void CQnetLink::Process()
 				else { // length is 29 or 32
 					if (inbound_list.size() > 0) {
 						SREFDSVT rdsvt;
-						rdsvt.head[0] = (unsigned char)(29 & 0xFF);
-						rdsvt.head[1] = (unsigned char)(29 >> 8 & 0x1F);
-						rdsvt.head[1] = (unsigned char)(rdsvt.head[1] | 0xFFFFFF80);
+						rdsvt.head[0] = (dstr.vpkt.ctrl & 0x40U) ? 32U : 29U;
+						rdsvt.head[1] = 0x80U;
 
 						memcpy(rdsvt.dsvt.title, "DSVT", 4);
 						rdsvt.dsvt.config = 0x20;
@@ -2928,10 +2926,12 @@ void CQnetLink::Process()
 							memcpy(rdsvt.dsvt.vasd.voice, dstr.vpkt.vasd.voice, 12);
 						else
 							memcpy(rdsvt.dsvt.vasd.voice, dstr.vpkt.vasd1.voice, 12);
+						if (dstr.vpkt.ctrl & 0x40U)
+							memcpy(rdsvt.dsvt.vend.end, endbytes, 6);
 
 						for (auto pos = inbound_list.begin(); pos != inbound_list.end(); pos++) {
 							SINBOUND *inbound = (SINBOUND *)pos->second;
-							sendto(ref_g2_sock, rdsvt.head, 29, 0, inbound->addr.GetPointer(), sizeof(struct sockaddr_in));
+							sendto(ref_g2_sock, rdsvt.head, rdsvt.head[0], 0, inbound->addr.GetPointer(), sizeof(struct sockaddr_in));
 						}
 					}
 
@@ -2972,9 +2972,8 @@ void CQnetLink::Process()
 							const bool isxrf = (rmt_xrf_port == to_remote_g2[i].addr.GetPort());
 							if (isxrf || (rmt_ref_port == to_remote_g2[i].addr.GetPort())) {
 								SREFDSVT rdsvt;
-								rdsvt.head[0] = (unsigned char)(29 & 0xFF);
-								rdsvt.head[1] = (unsigned char)(29 >> 8 & 0x1F);
-								rdsvt.head[1] = (unsigned char)(rdsvt.head[1] | 0xFFFFFF80);
+								rdsvt.head[0] = (dstr.vpkt.ctrl & 0x40U) ? 32U : 29U;
+								rdsvt.head[1] = 0x80U;
 
 								memcpy(rdsvt.dsvt.title, "DSVT", 4);
 								rdsvt.dsvt.config = 0x20;
@@ -2994,8 +2993,11 @@ void CQnetLink::Process()
 									rdsvt.dsvt.flagb[2] = to_remote_g2[i].from_mod;
 
 									sendto(xrf_g2_sock, rdsvt.dsvt.title, 27, 0, to_remote_g2[i].addr.GetPointer(), sizeof(struct sockaddr_in));
-								} else if (rmt_ref_port == to_remote_g2[i].addr.GetPort())
-									sendto(ref_g2_sock, rdsvt.head, 29, 0, to_remote_g2[i].addr.GetPointer(), sizeof(struct sockaddr_in));
+								} else if (rmt_ref_port == to_remote_g2[i].addr.GetPort()) {
+									if (32U == rdsvt.head[0])
+										memcpy(rdsvt.dsvt.vend.end, endbytes, 6);
+									sendto(ref_g2_sock, rdsvt.head, rdsvt.head[0], 0, to_remote_g2[i].addr.GetPointer(), sizeof(struct sockaddr_in));
+								}
 							} else if (rmt_dcs_port == to_remote_g2[i].addr.GetPort()) {
 								memset(dcs_buf, 0x0, 600);
 								dcs_buf[0] = dcs_buf[1] = dcs_buf[2] = '0';

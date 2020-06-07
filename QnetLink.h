@@ -106,6 +106,7 @@ private:
 	unsigned int max_dongles, saved_max_dongles;
 	int rf_inactivity_timer[3];
 	const unsigned char REF_ACK[3] = { 3, 96, 0 };
+	const unsigned char endbytes[6] = { 0x55U, 0x55U, 0x55U, 0x55U, 0xC8U, 0x7AU };
 
 	// the Key in this inbound_list map is the unique IP address of the remote
 	std::map<std::string, SINBOUND *> inbound_list;
