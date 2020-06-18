@@ -2909,6 +2909,12 @@ void CQnetLink::Process()
 					}
 				}
 				else { // length is 29 or 32
+					if (length == 32) {
+						printf("32 byte packet: %02x", dstr.vpkt.ctrl);
+						for (int i=0; i<15; i++)
+							printf(" %02x", dstr.vpkt.vasd1.UNKNOWN+i);
+						printf("\n");
+					}
 					if (inbound_list.size() > 0) {
 						SREFDSVT rdsvt;
 						rdsvt.head[0] = (dstr.vpkt.ctrl & 0x40U) ? 32U : 29U;
