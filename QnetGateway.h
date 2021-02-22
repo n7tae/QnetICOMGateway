@@ -27,6 +27,7 @@
 #include "aprs.h"
 #include "DStarDecode.h"
 #include "SockAddress.h"
+#include "Location.h"
 
 #define IP_SIZE 15
 #define MAXHOSTNAMELEN 64
@@ -41,7 +42,7 @@ using STOREMOTEG2 = struct to_remote_g2_tag {
 
 using STOREPEATER = struct torepeater_tag {
 	// help with header re-generation
-	unsigned char saved_hdr[58]; // repeater format
+	SDSTR saved_hdr; // repeater format
 	CSockAddress saved_adr;
 
 	unsigned short streamid;
@@ -78,6 +79,17 @@ using SBANDTXT = struct band_txt_tag {
 	int num_dv_frames;
 	int num_dv_silent_frames;
 	int num_bit_errors;
+};
+
+using SSD = struct sd_tag {
+	unsigned char header[41];
+	unsigned char message[21];
+	unsigned char gps[256];
+	unsigned int ih, im, ig;
+	unsigned char type;
+	bool first;
+	unsigned int size;
+	void Init() { ih = im = ig = 0; first = true; }
 };
 
 class CQnetGateway {
@@ -145,6 +157,10 @@ private:
 	// for handling APRS stuff
 	CAPRS *aprs;
 
+	SSD Sd[4];
+	SDSTR sdheader;
+	CLocation gps;
+
 	// sqlite3 database
 	CQnetDB qnDB;
 
@@ -169,10 +185,13 @@ private:
 	void APRSBeaconThread();
 	void ProcessTimeouts();
 	void ProcessSlowData(unsigned char *data, unsigned short sid);
+	void ProcessIncomingSD(const SDSVT &dsvt);
 	bool ProcessG2Msg(const unsigned char *data, const int mod, std::string &smrtgrp);
 	bool Flag_is_ok(unsigned char flag);
 	void UnpackCallsigns(const std::string &str, std::set<std::string> &set, const std::string &delimiters = ",");
 	void PrintCallsigns(const std::string &key, const std::set<std::string> &set);
+	bool Printable(unsigned char *s);
+	bool VoicePacketIsSync(const unsigned char *text) const;
 
 	// read configuration file
 	bool read_config(char *);

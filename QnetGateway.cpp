@@ -1,6 +1,6 @@
 /*
  *   Copyright (C) 2010 by Scott Lawson KI4LKF
- *   Copyright (C) 2017-2018 by Thomas Early N7TAE
+ *   Copyright (C) 2017-2020 by Thomas Early N7TAE
  *
  *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -56,7 +56,7 @@
 #include "QnetConfigure.h"
 #include "QnetDB.h"
 
-#define VERSION "QnetIcomGateway-511"
+#define VERSION "QnetIcomGateway-210221"
 
 #ifndef CFG_DIR
 #define CFG_DIR "/usr/local/etc"
@@ -393,7 +393,7 @@ void CQnetGateway::GetIRCDataThread()
 	bool not_announced[3];
 	for (int i=0; i<3; i++)
 		not_announced[i] = this->rptr.mod[i].defined;	// announce to all modules that are defined!
-	bool is_quadnet = (0 == ircddb.ip.compare("rr.openquad.net"));
+	bool is_quadnet = (0 == ircddb.ip.compare("ircv4.openquad.net"));
 	bool doFind = true;
 	while (keep_running) {
 		int rc = ii->getConnectionState();
@@ -668,6 +668,187 @@ bool CQnetGateway::ProcessG2Msg(const unsigned char *data, const int mod, std::s
 		part[mod] = 0;	// messages will never be spread across a superframe
 	}
 	return false;
+}
+
+bool CQnetGateway::Printable(unsigned char *s)
+{
+	bool rval = false;
+	for (unsigned i=0; s[i]; i++) {
+		if (0 == isprint(s[i])) {
+			rval = true;
+			s[i] = '?';
+		}
+	}
+	return rval;
+}
+
+bool CQnetGateway::VoicePacketIsSync(const unsigned char *text) const
+{
+	return *text==0x55U && *(text+1)==0x2DU && *(text+2)==0x16U;
+}
+
+void CQnetGateway::ProcessIncomingSD(const SDSVT &dsvt)
+{
+	int i;
+	for (i=0; i<3; i++) {
+		if (rptr.mod[i].defined && (toRptr[i].saved_hdr.vpkt.streamid == dsvt.streamid))
+				break;
+	}
+	// if i==3, then the streamid of this voice packet didn't match any module
+	SSD &sd = Sd[i];
+
+	if (VoicePacketIsSync(dsvt.vasd.text)) {
+		sd.first = true;
+		return;
+	}
+
+	const unsigned char c[3] = {
+		static_cast<unsigned char>(dsvt.vasd.text[0] ^ 0x70u),
+		static_cast<unsigned char>(dsvt.vasd.text[1] ^ 0x4fu),
+		static_cast<unsigned char>(dsvt.vasd.text[2] ^ 0x93u)
+	};	// unscramble
+
+	if (sd.first) {
+		// this is the first of a two voice-packet pair
+		// get the "size" and type from the first byte
+		sd.size = 0x0FU & c[0];
+		if (sd.size > 5) {
+			sd.size = 5;
+		}
+		int size = sd.size;
+		if (size > 2)
+			size = 2;
+		sd.type = 0xF0U & c[0];
+		switch (sd.type) {
+			case 0x30U:	// GPS data
+				if (sd.size + sd.ig < 255) {
+					memcpy(sd.gps+sd.ig, c+1, size);
+					if (c[1]=='\r' || c[2]=='\r') {
+						sd.gps[sd.ig + ((c[1] == '\r') ? 0 : 1)] = '\0';
+						if (i < 3) {
+							Printable(sd.gps);
+							if (showLastHeard && gps.Parse((const char *)&sd.gps)) {
+								char call[CALL_SIZE+1];
+								memcpy(call, toRptr[i].saved_hdr.vpkt.hdr.my, CALL_SIZE);
+								call[CALL_SIZE] = '\0';
+								qnDB.UpdatePosition(call, gps.MaidenHead(), gps.Latitude(), gps.Longitude());
+							}
+						}
+						sd.ig = sd.size = 0;
+					} else {
+						sd.ig += size;
+						sd.size -= size;
+					}
+				} else {
+					printf("GPS string is too large at %d bytes\n", sd.ig + sd.size);
+					sd.ig = sd.size = 0;
+				}
+				sd.first = false;
+				break;
+			case 0x40U:	// 20 character user message
+				if (sd.size * 5 == sd.im) {
+					memcpy(sd.message+sd.im, c+1, 2);
+					sd.im += 2;
+					sd.size = 3;
+				} else {
+					//printf("A message voiceframe, #%d, is out of order because message size is %d\n", sd.size, sd.im);
+					sd.im = sd.size = 0;
+				}
+				sd.first = false;
+				break;
+			case 0x50U:	// header
+				if (3 == i) {	// only when the streamid can't be matched
+					if (sd.size + sd.ih < 42) {	// make sure there's room
+						memcpy(sd.header+sd.ih, c+1, size);
+						sd.ih += size;
+						if (sd.ih == 41) {	// we have liftoff, calculate the checksum
+							memcpy(sdheader.vpkt.hdr.flag, sd.header, 39);
+							calcPFCS(sdheader.pkt_id, 58);
+							if (0 == memcmp(sd.header+39, sdheader.vpkt.hdr.pfcs, 2)) {	// checksum looks okay
+								printf("Got a slow data header: %36.36s\n", sd.header+3);
+								int mod = sdheader.vpkt.hdr.r1[CALL_SIZE-1] - 'A';
+								if (mod >= 0 && mod < 3 && rptr.mod[mod].defined) {
+									sdheader.vpkt.streamid = toRptr[mod].streamid;
+									if (0 == mod)
+										sdheader.vpkt.snd_term_id = 0x3U;
+									else
+										sdheader.vpkt.snd_term_id = mod;
+									memcpy(toRptr[mod].saved_hdr.pkt_id, sdheader.pkt_id, 58);	// copy to enable this and subsequent voice pacekets
+									sdheader.counter = G2_COUNTER_OUT++;
+									sendto(srv_sock, sdheader.pkt_id, 58, 0, toRptr[mod].saved_adr.GetCPointer(), toRptr[mod].saved_adr.GetSize());
+									toRptr[mod].sequence = dsvt.ctrl;
+									time(&toRptr[mod].last_time);
+									if (bool_qso_details)
+										printf("Slow Data Header: id=0x%04x flags=%x:%x:%x r1=%8.8s r2=%8.8s ur=%8.8s my=%8.8s nm=%4.4s\n", htons(sdheader.vpkt.streamid), sdheader.vpkt.hdr.flag[0], sdheader.vpkt.hdr.flag[1], sdheader.vpkt.hdr.flag[2], sdheader.vpkt.hdr.r1, sdheader.vpkt.hdr.r2, sdheader.vpkt.hdr.ur, sdheader.vpkt.hdr.my, sdheader.vpkt.hdr.nm);
+									sd.ih = sd.size = 0;
+								} else {
+									fprintf(stderr, "Got a valid slow data header but module %d doesn't exist\n", mod);
+								}
+							}
+						}
+					} else {
+						//printf("Header overflow, message has %d bytes, trying to add %d more\n", sd.ih, sd.size);
+						sd.ih = sd.size = 0;
+					}
+				}
+				sd.first = false;
+				break;
+			default:
+				return;
+		}
+	} else {
+		// this is the second of a two voice-frame pair
+		sd.first = true;
+		if (0 == sd.size)
+			return;
+		switch (sd.type) {
+			case 0x30U:	// GPS
+				memcpy(sd.gps+sd.ig, c, sd.size);
+				if (c[0]=='\r' || c[1]=='\r' || c[2]=='\r') {
+					if (c[0]=='\r')
+						sd.gps[sd.ig] = '\0';
+					else if (c[1]=='\r')
+						sd.gps[sd.ig+1] = '\0';
+					else
+						sd.gps[sd.ig+2] = '\0';
+					if (i < 3) {
+						Printable(sd.gps);
+						if (showLastHeard && gps.Parse((const char *)&sd.gps)) {
+							char call[CALL_SIZE+1];
+							memcpy(call, toRptr[i].saved_hdr.vpkt.hdr.my, CALL_SIZE);
+							call[CALL_SIZE] = '\0';
+							qnDB.UpdatePosition(call, gps.MaidenHead(), gps.Latitude(), gps.Longitude());
+						}
+					}
+					sd.ig = 0;
+				} else {
+					sd.ig += sd.size;
+					sd.gps[sd.ig] = 0;
+				}
+				break;
+			case 0x40U:	// message
+				memcpy(sd.message+sd.im, c, 3);
+				sd.im += 3;
+				if (sd.im >= 20) {
+					sd.message[20] = '\0';
+					Printable(sd.message);
+					if (showLastHeard && (i < 3) && memcmp(toRptr[i].saved_hdr.vpkt.hdr.nm, "RPTR", 4) && memcmp(sd.message, "VIA SMARTGP", 11)) {
+						char call[CALL_SIZE+1];
+						memcpy(call, toRptr[i].saved_hdr.vpkt.hdr.my, CALL_SIZE);
+						call[CALL_SIZE] = '\0';
+						qnDB.UpdateMessage(call, (const char *)&(sd.message));
+					}
+					sd.im = 0;
+				}
+				break;
+			case 0x50U:	// header
+				if ((3 == i) && sd.size) {
+					memcpy(sd.header+sd.ih, c, 3);
+					sd.ih += 3;
+				}
+				break;
+		}
+	}
 }
 
 // new_group is true if we are processing the first voice packet of a 2-voice packet pair. The high order nibble of the first byte of
@@ -1114,7 +1295,7 @@ void CQnetGateway::Process()
 							sendto(srv_sock, rptrbuf.pkt_id, 58, 0, toRptr[i].addr.GetCPointer(), toRptr[i].addr.GetSize());
 
 							/* save the header */
-							memcpy(toRptr[i].saved_hdr, rptrbuf.pkt_id, 58);
+							memcpy(toRptr[i].saved_hdr.pkt_id, rptrbuf.pkt_id, 58);
 							toRptr[i].saved_adr = fromDst4;
 
 							/* This is the active streamid */
@@ -1124,12 +1305,14 @@ void CQnetGateway::Process()
 							/* time it, in case stream times out */
 							time(&toRptr[i].last_time);
 
+							Sd[i].Init();
+
 							toRptr[i].sequence = rptrbuf.vpkt.ctrl;
 							nextctrl[i] = 0U;	// ctrl of the next voice packet (used for healing code)
 						}
 					}
 				} else {	// g2buflen == 27
-
+					ProcessIncomingSD(g2buf);
 					/* find out which repeater module to send the data to */
 					int i;
 					for (i=0; i<3; i++) {
@@ -1221,7 +1404,7 @@ void CQnetGateway::Process()
 							/* End of stream ? */
 							if (g2buf.ctrl & 0x40) {
 								/* clear the saved header */
-								memset(toRptr[i].saved_hdr, 0, sizeof(toRptr[i].saved_hdr));
+								memset(toRptr[i].saved_hdr.pkt_id, 0, 58);
 								toRptr[i].saved_adr.Clear();
 
 								toRptr[i].last_time = 0;
@@ -1248,16 +1431,15 @@ void CQnetGateway::Process()
 							/* for which repeater this stream has timed out ?  */
 							for (i = 0; i < 3; i++) {
 								/* match saved stream ? */
-								if (0==memcmp(toRptr[i].saved_hdr + 14, &g2buf.streamid, 2) && toRptr[i].saved_adr==fromDst4) {
+								if ((toRptr[i].saved_hdr.vpkt.streamid == g2buf.streamid) && toRptr[i].saved_adr==fromDst4) {
 									/* repeater module is inactive ?  */
 									if (toRptr[i].last_time==0 && band_txt[i].last_time==0) {
 										printf("Re-generating header for streamID=%04x\n", g2buf.streamid);
 
-										toRptr[i].saved_hdr[4] = (unsigned char)((G2_COUNTER_OUT>>8) & 0xFFU);
-										toRptr[i].saved_hdr[5] = (unsigned char)((G2_COUNTER_OUT++) & 0xFFU);
+										toRptr[i].saved_hdr.counter = G2_COUNTER_OUT++;
 
 										/* re-generate/send the header */
-										sendto(srv_sock, toRptr[i].saved_hdr, 58, 0, toRptr[i].addr.GetCPointer(), toRptr[i].addr.GetSize());
+										sendto(srv_sock, toRptr[i].saved_hdr.pkt_id, 58, 0, toRptr[i].addr.GetCPointer(), toRptr[i].addr.GetSize());
 
 										/* send this audio packet to repeater */
 										memcpy(rptrbuf.pkt_id, "DSTR", 4);
@@ -2527,7 +2709,7 @@ bool CQnetGateway::Init(char *cfgfile)
 		// the repeater modules run on these ports
 		//memset(&toRptr[i], 0, sizeof(toRptr[i]));
 
-		memset(toRptr[i].saved_hdr, 0, sizeof(toRptr[i].saved_hdr));
+		memset(toRptr[i].saved_hdr.pkt_id, 0, 8);
 		toRptr[i].saved_adr.Clear();
 
 		toRptr[i].streamid = 0;
@@ -2540,6 +2722,21 @@ bool CQnetGateway::Init(char *cfgfile)
 
 		toRptr[i].sequence = 0x0;
 	}
+
+	for (int i=0; i<4; i++)
+		Sd[i].Init();
+
+	memcpy(sdheader.pkt_id, "DSTR", 4);
+	sdheader.flag[0] = 0x73U;
+	sdheader.flag[1] = 0x12U;
+	sdheader.flag[2] = 0x00U;
+	sdheader.remaining = 0x30U;
+	sdheader.vpkt.icm_id = 0x20U;
+	sdheader.vpkt.ctrl = 0x80U;
+	sdheader.vpkt.dst_rptr_id = 0x0U;
+	sdheader.vpkt.snd_rptr_id = 0x1U;
+	sdheader.vpkt.snd_term_id = 0x1U;
+
 
 	/*
 	   Initialize the end_of_audio that will be sent to the local repeater
